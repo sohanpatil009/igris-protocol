@@ -1,0 +1,27 @@
+pub mod clipboard;
+pub mod config;
+pub mod constants;
+pub mod crypto;
+pub mod device;
+pub mod discovery;
+pub mod errors;
+pub mod events;
+pub mod manager;
+pub mod notification;
+pub mod pairing;
+pub mod permissions;
+pub mod protocol;
+pub mod storage;
+pub mod sync;
+pub mod transport;
+
+pub use clipboard::{ClipboardData, ClipboardManager};
+pub use config::EcosystemConfig;
+pub use device::{Capabilities, DeviceStatus, EcoDevice};
+pub use discovery::{DiscoveredEcoDevice, ECO_NETWORK_DEVICES};
+pub use errors::{EcoError, EcoResult};
+pub use events::{EcoEvent, EventBus};
+pub use manager::{EcoManager, init_eco_manager, start_eco_manager, init_eco_manager_async, start_eco_manager_async, shutdown_eco_manager, ECO_MANAGER, get_eco_manager};
+pub use notification::{NotificationData, NotificationManager, get_notifications, set_notifications};
+pub use pairing::{generate_otp_code, hash_otp_code, PairingManager, PAIRING_MANAGER, init_pairing_manager, get_pairing_manager};
+pub use protocol::{EcoMessage, MessageType};
