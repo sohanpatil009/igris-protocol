@@ -63,17 +63,15 @@ impl ClipboardManager {
 
                 let is_own_change = Some(&hash) == guard.last_applied_hash.as_ref();
                 let is_known = Some(&hash) == guard.last_content_hash.as_ref();
-                let is_delivered = guard.last_delivered_hash.as_ref() == Some(&hash);
-                if is_own_change || (is_known && is_delivered) {
+                if is_own_change || is_known {
                     continue;
                 }
 
                 tracing::info!(
-                    "[ECO] Clipboard changed: hash={} own={} known={} delivered={}",
+                    "[ECO] Clipboard changed: hash={} own={} known={}",
                     &hash[..16],
                     is_own_change,
                     is_known,
-                    is_delivered
                 );
 
                 if !is_known {
@@ -111,12 +109,24 @@ impl ClipboardManager {
         }
     }
 
-    pub fn apply_clipboard(&mut self, data: &ClipboardData) -> EcoResult<()> {
-        if self.last_content_hash.as_ref() == Some(&data.content_hash) {
-            return Ok(());
-        }
+    /// Check whether incoming clipboard data should be applied (dedup gate).
+    /// Returns `true` if the content is new and should be written to the
+    /// local clipboard. Caller must call `mark_applied()` after a successful
+    /// write.
+    pub fn should_apply(&self, data: &ClipboardData) -> bool {
+        self.last_content_hash.as_ref() != Some(&data.content_hash)
+    }
 
-        self.platform.set_text(&data.content)?;
+    /// Write incoming clipboard to the local platform clipboard. This is a
+    /// blocking I/O call (FFI into Android/iOS) and must NEVER be called
+    /// while holding the Mutex.
+    pub fn write_to_platform(&self, data: &ClipboardData) -> EcoResult<()> {
+        self.platform.set_text(&data.content)
+    }
+
+    /// Mark clipboard as applied (update dedup hashes, emit event). Must be
+    /// called while holding the Mutex, but after `write_to_platform()`.
+    pub fn mark_applied(&mut self, data: &ClipboardData) {
         self.last_applied_hash = Some(data.content_hash.clone());
         self.last_content_hash = Some(data.content_hash.clone());
         // Arrived via the mesh, so the mesh already has it — treat as delivered
@@ -125,7 +135,6 @@ impl ClipboardManager {
 
         let arc = Arc::new(data.clone());
         self.event_bus.emit(EcoEvent::ClipboardApplied(arc));
-        Ok(())
     }
 
     pub fn get_current_hash(&self) -> Option<String> {
@@ -143,8 +152,7 @@ impl ClipboardManager {
         }
         let hash = hash_content(text);
         let is_known = Some(&hash) == self.last_content_hash.as_ref();
-        let is_delivered = self.last_delivered_hash.as_ref() == Some(&hash);
-        if is_known && is_delivered {
+        if is_known {
             return Ok(());
         }
 

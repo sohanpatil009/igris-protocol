@@ -191,6 +191,7 @@ impl EcoManager {
         let discovery = Arc::new(DeviceDiscovery::new(
             self.event_bus.clone(),
         ));
+        discovery.set_runtime_config(self.config.clone());
         discovery.start_server(&http_addr).await;
         discovery.start_discovery().await;
         discovery.run_cleanup().await;
@@ -214,12 +215,27 @@ impl EcoManager {
             let manager_ptr = self.clipboard.clone().unwrap();
             event_bus.subscribe(Arc::new(move |event| {
                 if let EcoEvent::ClipboardReceived(data, _from) = event {
-                    println!("[ECO] Applying received clipboard (hash={})", &data.content_hash[..16]);
+                    let hash_short = if data.content_hash.len() >= 16 { &data.content_hash[..16] } else { &data.content_hash };
+                    println!("[ECO] Applying received clipboard (hash={})", hash_short);
                     let manager = manager_ptr.clone();
-                    tokio::spawn(async move {
-                        if let Ok(mut guard) = manager.lock() {
-                            let _ = guard.apply_clipboard(&data);
+                    // Use spawn_blocking: std::sync::Mutex::lock() blocks the
+                    // current thread; must never run on the tokio runtime.
+                    tokio::task::spawn_blocking(move || {
+                        let mut guard = match manager.lock() {
+                            Ok(g) => g,
+                            Err(_) => return,
+                        };
+                        if !guard.should_apply(&data) {
+                            return;
                         }
+                        // Platform write is blocking I/O (Android JNI) — do it
+                        // while holding the lock so no concurrent poll overwrites
+                        // our dedup state between check and write.
+                        if let Err(e) = guard.write_to_platform(&data) {
+                            println!("[ECO] platform write failed: {}", e);
+                            return;
+                        }
+                        guard.mark_applied(&data);
                     });
                 }
             }));
@@ -348,7 +364,7 @@ impl EcoManager {
             {
                 event_bus.subscribe(Arc::new(move |_event| {
                     if let Some(ref mgr) = notification {
-                        if let Ok(guard) = mgr.lock() {
+                        if let Ok(guard) = mgr.try_lock() {
                             crate::eco::notification::set_notifications(guard.get_notifications());
                         }
                     }
@@ -466,7 +482,12 @@ impl EcoManager {
             let mut guard = clipboard.lock().map_err(|_| {
                 EcoError::Clipboard("Lock failed".to_string())
             })?;
-            guard.apply_clipboard(&data)
+            if !guard.should_apply(&data) {
+                return Ok(());
+            }
+            guard.write_to_platform(&data)?;
+            guard.mark_applied(&data);
+            Ok(())
         } else {
             Err(EcoError::NotInitialized)
         }

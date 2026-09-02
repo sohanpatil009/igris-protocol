@@ -6,6 +6,12 @@ use crate::eco::protocol::{
 };
 use std::net::SocketAddr;
 
+/// Select http vs https based on the peer's port so we can talk to
+/// both TLS-capable peers (port 53328) and HTTP-only peers (port 53327).
+fn scheme_for_addr(addr: &SocketAddr) -> &'static str {
+    if addr.port() == DEFAULT_ECO_PORT { "http" } else { "https" }
+}
+
 pub struct EcoTransport {
     http_client: reqwest::Client,
 }
@@ -20,13 +26,13 @@ impl EcoTransport {
         Self { http_client }
     }
 
-    /// Send clipboard payload to a peer via HTTPS (FastSwap TLS port).
+    /// Send clipboard payload to a peer.
     pub async fn send_clipboard(
         &self,
         addr: &SocketAddr,
         payload: &ClipboardSyncPayload,
     ) -> EcoResult<()> {
-        let url = format!("https://{}/api/ecosystem/v1/clipboard/sync", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/clipboard/sync", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(payload)
@@ -43,13 +49,13 @@ impl EcoTransport {
         Ok(())
     }
 
-    /// Send notification to a peer via HTTPS.
+    /// Send notification to a peer.
     pub async fn send_notification(
         &self,
         addr: &SocketAddr,
         payload: &NotificationSyncPayload,
     ) -> EcoResult<()> {
-        let url = format!("https://{}/api/ecosystem/v1/notification/sync", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/notification/sync", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(payload)
@@ -66,13 +72,13 @@ impl EcoTransport {
         Ok(())
     }
 
-    /// Send notification reply to a peer via HTTPS.
+    /// Send notification reply to a peer.
     pub async fn send_notification_reply(
         &self,
         addr: &SocketAddr,
         payload: &NotificationReplyPayload,
     ) -> EcoResult<()> {
-        let url = format!("https://{}/api/ecosystem/v1/notification/reply", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/notification/reply", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(payload)
@@ -89,13 +95,13 @@ impl EcoTransport {
         Ok(())
     }
 
-    /// Tell a peer to dismiss one of its notifications via HTTPS.
+    /// Tell a peer to dismiss one of its notifications.
     pub async fn send_notification_dismiss(
         &self,
         addr: &SocketAddr,
         payload: &NotificationDismissPayload,
     ) -> EcoResult<()> {
-        let url = format!("https://{}/api/ecosystem/v1/notification/dismiss", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/notification/dismiss", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(payload)
@@ -112,13 +118,13 @@ impl EcoTransport {
         Ok(())
     }
 
-    /// Ask a peer to fire one of its notification's action buttons via HTTPS.
+    /// Ask a peer to fire one of its notification's action buttons.
     pub async fn send_notification_action(
         &self,
         addr: &SocketAddr,
         payload: &NotificationActionPayload,
     ) -> EcoResult<()> {
-        let url = format!("https://{}/api/ecosystem/v1/notification/action", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/notification/action", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(payload)
@@ -135,7 +141,7 @@ impl EcoTransport {
         Ok(())
     }
 
-    /// Send a pairing request to a peer via HTTPS. The peer trusts us
+    /// Send a pairing request to a peer. The peer trusts us
     /// immediately (direct two-way link) — this is the phone-initiated LINK.
     pub async fn send_pair_request(
         &self,
@@ -150,7 +156,7 @@ impl EcoTransport {
             sender_name: String,
             sender_port: u16,
         }
-        let url = format!("https://{}/api/ecosystem/v1/pair/request", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/pair/request", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(&PairRequestPayload {
@@ -182,7 +188,7 @@ impl EcoTransport {
         struct UntrustPayload {
             device_id: String,
         }
-        let url = format!("https://{}/api/ecosystem/v1/pair/untrust", addr);
+        let url = format!("{}://{}/api/ecosystem/v1/pair/untrust", scheme_for_addr(addr), addr);
         let resp = self.http_client
             .post(&url)
             .json(&UntrustPayload {

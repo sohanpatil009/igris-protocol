@@ -308,6 +308,8 @@ impl NotificationManager {
         self.store.save(&self.storage_path);
         self.event_bus
             .emit(EcoEvent::NotificationReceived(notif.clone(), self.local_device_id.clone()));
+        // Update cache directly since the event handler uses try_lock()
+        crate::eco::notification::set_notifications(self.store.notifications.clone());
         Some(PushResult {
             notification: notif,
             is_update,

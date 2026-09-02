@@ -77,6 +77,10 @@ impl PairingManager {
         self.active_sessions.clone()
     }
 
+    pub fn get_trusted_ids(&self) -> Vec<String> {
+        self.storage.lock().map(|s| s.get_trusted_device_ids().clone()).unwrap_or_default()
+    }
+
     pub fn generate_otp() -> String {
         generate_otp_code()
     }

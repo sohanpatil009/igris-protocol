@@ -8,10 +8,10 @@ pub mod tls;
 pub use models::*;
 pub use network::*;
 
+use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
-use anyhow::Result;
 
 /// Standard FastSwap TLS port (53318) — every peer binds this unless its
 /// primary port collides (port+1 fallback keeps 53317/53318 for default).
@@ -34,7 +34,10 @@ static FASTSWAP_PATHS: once_cell::sync::Lazy<Mutex<Option<FastSwapPaths>>> =
 /// before the FastSwap server binds.
 pub fn set_fastswap_paths(certs_dir: std::path::PathBuf, downloads_dir: std::path::PathBuf) {
     if let Ok(mut guard) = FASTSWAP_PATHS.lock() {
-        *guard = Some(FastSwapPaths { certs_dir, downloads_dir });
+        *guard = Some(FastSwapPaths {
+            certs_dir,
+            downloads_dir,
+        });
     }
 }
 
@@ -146,7 +149,10 @@ static OUTBOUND_SESSIONS: once_cell::sync::Lazy<Arc<RwLock<HashSet<String>>>> =
 
 /// Mark a session as initiated locally (before the first upload task runs).
 pub async fn register_outbound(session_id: &str) {
-    OUTBOUND_SESSIONS.write().await.insert(session_id.to_string());
+    OUTBOUND_SESSIONS
+        .write()
+        .await
+        .insert(session_id.to_string());
 }
 
 /// Snapshot of all outbound session ids.
@@ -214,7 +220,11 @@ impl FastSwapManager {
             .map_err(|e| anyhow::anyhow!("TLS init task panicked: {}", e))?
             .map_err(|e| anyhow::anyhow!("TLS init error: {}", e))?;
 
-        let tls_port = if http_port == 53317 { 53318 } else { http_port + 1 };
+        let tls_port = if http_port == 53317 {
+            53318
+        } else {
+            http_port + 1
+        };
 
         let proxy_handle = tokio::spawn(async move {
             let _ = network::start_tls_proxy(tls_port, http_port, tls_cfg.server_config).await;
@@ -268,7 +278,11 @@ pub fn get_fastswap_tls_port() -> u16 {
     if let Ok(guard) = FASTSWAP_MANAGER.lock() {
         if let Some(manager) = guard.as_ref() {
             let http_port = manager.port;
-            return if http_port == 53317 { 53318 } else { http_port + 1 };
+            return if http_port == 53317 {
+                53318
+            } else {
+                http_port + 1
+            };
         }
     }
     53318
@@ -291,7 +305,9 @@ pub async fn start_on_demand() {
         None => {
             // Compute on first access (fallback)
             let local_ip = local_ip_address::local_ip()
-                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 100)))
+                .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    192, 168, 1, 100,
+                )))
                 .to_string();
             let device = Device::new_local(
                 format!("IGRIS-{}", whoami::username()),
@@ -412,10 +428,7 @@ pub async fn is_transfer_approved(session_id: &str) -> bool {
 
 /// Drop the approval marker once the confirm handshake has consumed it.
 pub async fn clear_approved(session_id: &str) {
-    APPROVED_SESSIONS
-        .write()
-        .await
-        .retain(|s| s != session_id);
+    APPROVED_SESSIONS.write().await.retain(|s| s != session_id);
 }
 
 impl Drop for FastSwapManager {
@@ -448,13 +461,10 @@ mod tests {
 
         approve_transfer(session_id).await;
 
-        let approved = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            notified,
-        )
-        .await
-        .expect("timeout waiting for notification")
-        .expect("task panicked");
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("timeout waiting for notification")
+            .expect("task panicked");
 
         assert!(approved, "transfer should be approved");
     }
@@ -477,13 +487,10 @@ mod tests {
 
         deny_transfer(session_id).await;
 
-        let approved = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            notified,
-        )
-        .await
-        .expect("timeout waiting for notification")
-        .expect("task panicked");
+        let approved = tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("timeout waiting for notification")
+            .expect("task panicked");
 
         assert!(!approved, "transfer should not be approved after denial");
     }
@@ -566,7 +573,9 @@ mod tests {
 
         let pending_list = get_pending_transfers().await;
         assert!(
-            pending_list.iter().any(|t| t.session_id == session_id && t.awaiting_approval),
+            pending_list
+                .iter()
+                .any(|t| t.session_id == session_id && t.awaiting_approval),
             "awaiting transfer must not be pruned while the user is deciding"
         );
     }

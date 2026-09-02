@@ -1,17 +1,18 @@
+use crate::eco::config::EcosystemConfig;
 use crate::eco::constants::*;
 use crate::eco::device::EcoDevice;
 use crate::eco::events::{EcoEvent, EventBus};
 use crate::eco::protocol::{
     ClipboardSyncPayload, NotificationActionPayload, NotificationDismissPayload,
-    NotificationSyncPayload, NotificationReplyPayload,
+    NotificationReplyPayload, NotificationSyncPayload,
 };
 use axum::extract::ConnectInfo;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DiscoveredEcoDevice {
@@ -26,6 +27,10 @@ pub struct DiscoveredEcoDevice {
     /// True when the peer's `/info` reported `device_type == "mobile"`.
     #[serde(default)]
     pub is_mobile: bool,
+    /// Peer's advertised FastSwap TLS port (from `/info` `fastswap_port`).
+    /// 0 = not reported (old binary) → fall back to FASTSWAP_TLS_PORT.
+    #[serde(default)]
+    pub fastswap_port: u16,
 }
 
 #[derive(Deserialize)]
@@ -36,7 +41,9 @@ struct PairRequestPayload {
     sender_port: u16,
 }
 
-fn default_port() -> u16 { ECO_TLS_PORT }
+fn default_port() -> u16 {
+    ECO_TLS_PORT
+}
 
 #[derive(Deserialize)]
 struct UntrustPayload {
@@ -90,7 +97,10 @@ pub fn local_subnets() -> Vec<String> {
         // Skip loopback, link-local (169.254/16) and 192.0.0/24 (Qualcomm
         // rmnet internal addressing — never carries LAN peers, and probing
         // its 254 dead addresses wastes ~10s per scan pass).
-        if v4.is_loopback() || (octets[0] == 169 && octets[1] == 254) || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0) {
+        if v4.is_loopback()
+            || (octets[0] == 169 && octets[1] == 254)
+            || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+        {
             continue;
         }
         let subnet = format!("{}.{}.{}", octets[0], octets[1], octets[2]);
@@ -103,7 +113,11 @@ pub fn local_subnets() -> Vec<String> {
         subnets.push((is_private, subnet));
     }
     subnets.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    subnets.into_iter().take(MAX_SCAN_SUBNETS).map(|(_, s)| s).collect()
+    subnets
+        .into_iter()
+        .take(MAX_SCAN_SUBNETS)
+        .map(|(_, s)| s)
+        .collect()
 }
 
 pub(crate) struct DiscoveredDevice {
@@ -114,6 +128,7 @@ pub(crate) struct DiscoveredDevice {
 pub struct DeviceDiscovery {
     known_devices: Arc<RwLock<HashMap<String, DiscoveredDevice>>>,
     event_bus: Arc<EventBus>,
+    runtime_config: Arc<std::sync::RwLock<crate::eco::config::EcosystemConfig>>,
 }
 
 impl DeviceDiscovery {
@@ -121,6 +136,15 @@ impl DeviceDiscovery {
         Self {
             known_devices: Arc::new(RwLock::new(HashMap::new())),
             event_bus,
+            runtime_config: Arc::new(std::sync::RwLock::new(
+                crate::eco::config::EcosystemConfig::default(),
+            )),
+        }
+    }
+
+    pub fn set_runtime_config(&self, config: crate::eco::config::EcosystemConfig) {
+        if let Ok(mut guard) = self.runtime_config.write() {
+            *guard = config;
         }
     }
 
@@ -132,197 +156,310 @@ impl DeviceDiscovery {
         let event_bus = self.event_bus.clone();
         let local_id = crate::eco::pairing::get_local_device_id();
         let local_name = crate::eco::pairing::get_local_device_name();
+        let runtime_config = self.runtime_config.clone();
 
         let app = axum::Router::new()
-            .route("/api/ecosystem/v1/info", axum::routing::get({
-                let dev_id = local_id.clone();
-                let dev_name = local_name.clone();
-                move || {
-                    let did = dev_id.clone();
-                    let dnm = dev_name.clone();
-                    async move {
-                        let fastswap_tls_port = crate::fastswap::get_fastswap_tls_port();
-                        axum::Json(serde_json::json!({
-                            "status": "ok",
-                            "ecosystem": true,
-                            "clipboard_sync": true,
-                            "notification_sync": true,
-                            "device_id": did,
-                            "device_name": dnm,
-                            "device_type": "mobile",
-                            "fastswap_port": fastswap_tls_port,
-                        }))
-                    }
-                }
-            }))
-            .route("/api/ecosystem/v1/clipboard/sync", axum::routing::post({
-                let bus = event_bus.clone();
-                move |body: axum::extract::Json<ClipboardSyncPayload>| {
-                    let bus = bus.clone();
-                    async move {
-                        let payload = body.0;
-                        let data = crate::eco::clipboard::ClipboardData {
-                            content: payload.content,
-                            content_type: payload.content_type,
-                            content_hash: payload.content_hash,
-                            source_device: payload.source_device,
-                            timestamp: payload.timestamp,
-                        };
-                        bus.emit(EcoEvent::ClipboardReceived(
-                            std::sync::Arc::new(data),
-                            String::new(),
-                        ));
-                        axum::Json(serde_json::json!({"status": "ok"}))
-                    }
-                }
-            }))
-            .route("/api/ecosystem/v1/pair/request", axum::routing::post({
-                let bus = event_bus.clone();
-                let dev_id = local_id.clone();
-                let dev_name = local_name.clone();
-                move |ConnectInfo(remote_addr): ConnectInfo<SocketAddr>, body: axum::extract::Json<PairRequestPayload>| {
-                    let bus = bus.clone();
-                    let dev_id = dev_id.clone();
-                    let dev_name = dev_name.clone();
-                    async move {
-                        let p = body.0;
-                        let sender_id = p.sender_id;
-                        let sender_name = p.sender_name;
-
-                        // Direct two-way link: trust the requesting device immediately.
-                        let mut eco_network = ECO_NETWORK_DEVICES.write().await;
-                        if let Some(dev) = eco_network.iter_mut().find(|d| d.id == sender_id) {
-                            dev.is_trusted = true;
-                        } else {
-                            eco_network.push(DiscoveredEcoDevice {
-                                id: sender_id.clone(),
-                                name: sender_name.clone(),
-                                hostname: String::new(),
-                                ip: remote_addr.ip().to_string(),
-                                port: p.sender_port,
-                                is_trusted: true,
-                                is_online: true,
-                                last_seen_secs: 0,
-                                is_mobile: false, // corrected on the next discovery scan
-                            });
-                        }
-                        drop(eco_network);
-
-                        // Persist trust so it survives restarts.
-                        crate::eco::pairing::persist_trust(&sender_id);
-
-                        let mut trusted = crate::eco::device::EcoDevice::new(sender_name.clone());
-                        trusted.id = uuid::Uuid::parse_str(&sender_id).unwrap_or_else(|_| {
-                            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, sender_id.as_bytes())
-                        });
-                        trusted.addr = Some(remote_addr);
-
-                        bus.emit(EcoEvent::DeviceTrusted(
-                            std::sync::Arc::new(trusted)
-                        ));
-
-                        axum::Json(serde_json::json!({
-                            "status": "ok",
-                            "trusted": true,
-                            "receiver_id": dev_id,
-                            "receiver_name": dev_name,
-                        }))
-                    }
-                }
-            }))
-                .route("/api/ecosystem/v1/pair/untrust", axum::routing::post({
-                    move |body: axum::extract::Json<UntrustPayload>| {
+            .route(
+                "/api/ecosystem/v1/info",
+                axum::routing::get({
+                    let dev_id = local_id.clone();
+                    let dev_name = local_name.clone();
+                    let cfg_ref = runtime_config.clone();
+                    move || {
+                        let did = dev_id.clone();
+                        let dnm = dev_name.clone();
+                        let cfg_ref = cfg_ref.clone();
                         async move {
-                            let p = body.0;
-                            let mut eco_network = ECO_NETWORK_DEVICES.write().await;
-                            for dev in eco_network.iter_mut() {
-                                if dev.id == p.device_id {
-                                    dev.is_trusted = false;
+                            let fastswap_tls_port = crate::fastswap::get_fastswap_tls_port();
+                            let (cfg_clipboard_sync, cfg_notification_sync) = {
+                                let cfg_guard = cfg_ref.read().unwrap();
+                                (cfg_guard.clipboard_sync, cfg_guard.notification_sync)
+                            };
+
+                            let trusted_peers: Vec<String> = {
+                                if let Some(guard) = crate::eco::pairing::get_pairing_manager() {
+                                    if let Some(manager) = guard.as_ref() {
+                                        manager.get_trusted_ids()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                } else {
+                                    Vec::new()
                                 }
-                            }
-                            drop(eco_network);
-                            crate::eco::pairing::persist_untrust(&p.device_id);
+                            };
+
+                            axum::Json(serde_json::json!({
+                                "status": "ok",
+                                "ecosystem": true,
+                                "clipboard_sync": cfg_clipboard_sync,
+                                "notification_sync": cfg_notification_sync,
+                                "device_id": did,
+                                "device_name": dnm,
+                                "device_type": "mobile",
+                                "fastswap_port": fastswap_tls_port,
+                                "trusted_peers": trusted_peers,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/clipboard/sync",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<ClipboardSyncPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let payload = body.0;
+                            let hash = payload.content_hash.clone();
+                            let data = crate::eco::clipboard::ClipboardData {
+                                content: payload.content,
+                                content_type: payload.content_type,
+                                content_hash: hash.clone(),
+                                source_device: payload.source_device,
+                                timestamp: payload.timestamp,
+                            };
+                            let hash_prefix = if hash.len() >= 8 { &hash[..8] } else { &hash };
+                            tracing::info!("[ECO] clipboard/sync received hash={}", hash_prefix);
+                            // Fire-and-forget: emit on a Tokio blocking-pool
+                            // thread so the HTTP response is returned
+                            // immediately. bus.emit() calls all handlers
+                            // synchronously (FFI callbacks to Kotlin, lock
+                            // acquisitions, etc.) — doing that inline would block
+                            // the axum tokio worker, starving the HTTP server
+                            // when handlers contend on the same std::sync::Mutex
+                            // the clipboard polling loop uses.
+                            //
+                            // This MUST be `tokio::task::spawn_blocking`, not a
+                            // bare `std::thread::spawn`: the clipboard-apply
+                            // subscriber in `manager.rs` itself calls
+                            // `tokio::task::spawn_blocking`, which panics with
+                            // "no reactor running" unless the *calling* thread
+                            // already has a Tokio runtime context. A bare OS
+                            // thread has none — Tokio's blocking pool does — so
+                            // a bare thread here silently dropped every incoming
+                            // clipboard push before it ever reached the platform
+                            // write. That was the root cause of the PC-to-phone
+                            // one-way clipboard sync failure: the HTTP POST
+                            // succeeded and the event fired (FFI listener
+                            // subscribers saw it fine), but the apply-to-platform
+                            // subscriber panicked on this thread before calling
+                            // into the Kotlin ClipboardProvider at all.
+                            let arc = std::sync::Arc::new(data);
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::ClipboardReceived(arc, String::new()));
+                            });
+                            tracing::info!("[ECO] clipboard/sync emit spawned");
                             axum::Json(serde_json::json!({"status": "ok"}))
                         }
                     }
-                }))
-            .route("/api/ecosystem/v1/notification/sync", axum::routing::post({
-                let bus = event_bus.clone();
-                move |body: axum::extract::Json<NotificationSyncPayload>| {
-                    let bus = bus.clone();
-                    async move {
-                        let payload = body.0;
-                        let notif = crate::eco::notification::NotificationData {
-                            id: payload.notification_id,
-                            notification_key: payload.notification_key,
-                            app_package: payload.app_package,
-                            app_name: payload.app_name,
-                            title: payload.title,
-                            body: payload.body,
-                            icon: payload.icon,
-                            icon_hash: payload.icon_hash,
-                            actions: payload.actions,
-                            can_reply: payload.can_reply,
-                            messages: payload.messages,
-                            device_name: payload.source_device_name,
-                            device_id: payload.source_device_id,
-                            timestamp: payload.timestamp,
-                            read: false,
-                            replied: false,
-                        };
-                        bus.emit(EcoEvent::NotificationReceived(
-                            notif,
-                            "remote".to_string(),
-                        ));
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/pair/request",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    let dev_id = local_id.clone();
+                    let dev_name = local_name.clone();
+                    move |ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+                          body: axum::extract::Json<PairRequestPayload>| {
+                        let bus = bus.clone();
+                        let dev_id = dev_id.clone();
+                        let dev_name = dev_name.clone();
+                        async move {
+                            let p = body.0;
+                            let sender_id = p.sender_id;
+                            let sender_name = p.sender_name;
+
+                            // Direct two-way link: trust the requesting device immediately.
+                            let mut eco_network = ECO_NETWORK_DEVICES.write().await;
+                            if let Some(dev) = eco_network.iter_mut().find(|d| d.id == sender_id) {
+                                dev.is_trusted = true;
+                            } else {
+                                eco_network.push(DiscoveredEcoDevice {
+                                    id: sender_id.clone(),
+                                    name: sender_name.clone(),
+                                    hostname: String::new(),
+                                    ip: remote_addr.ip().to_string(),
+                                    port: p.sender_port,
+                                    fastswap_port: 0,
+                                    is_trusted: true,
+                                    is_online: true,
+                                    last_seen_secs: 0,
+                                    is_mobile: false, // corrected on the next discovery scan
+                                });
+                            }
+                            drop(eco_network);
+
+                            // Persist trust so it survives restarts.
+                            crate::eco::pairing::persist_trust(&sender_id);
+
+                            let mut trusted =
+                                crate::eco::device::EcoDevice::new(sender_name.clone());
+                            trusted.id = uuid::Uuid::parse_str(&sender_id).unwrap_or_else(|_| {
+                                uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, sender_id.as_bytes())
+                            });
+                            trusted.addr = Some(remote_addr);
+
+                            bus.emit(EcoEvent::DeviceTrusted(std::sync::Arc::new(trusted)));
+
+                            axum::Json(serde_json::json!({
+                                "status": "ok",
+                                "trusted": true,
+                                "receiver_id": dev_id,
+                                "receiver_name": dev_name,
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/pair/untrust",
+                axum::routing::post({
+                    move |body: axum::extract::Json<UntrustPayload>| async move {
+                        let p = body.0;
+                        let mut eco_network = ECO_NETWORK_DEVICES.write().await;
+                        for dev in eco_network.iter_mut() {
+                            if dev.id == p.device_id {
+                                dev.is_trusted = false;
+                            }
+                        }
+                        drop(eco_network);
+                        crate::eco::pairing::persist_untrust(&p.device_id);
                         axum::Json(serde_json::json!({"status": "ok"}))
                     }
-                }
-            }))
-            .route("/api/ecosystem/v1/notification/reply", axum::routing::post({
-                let bus = event_bus.clone();
-                move |body: axum::extract::Json<NotificationReplyPayload>| {
-                    let bus = bus.clone();
-                    async move {
-                        let payload = body.0;
-                        let reply = crate::eco::notification::NotificationReply {
-                            notification_id: payload.notification_id,
-                            notification_key: payload.notification_key,
-                            reply_text: payload.reply_text,
-                            source_device_id: payload.source_device_id,
-                        };
-                        bus.emit(EcoEvent::NotificationReplied(reply));
-                        axum::Json(serde_json::json!({"status": "ok"}))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/sync",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<NotificationSyncPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let payload = body.0;
+                            if !crate::eco::pairing::is_trusted_sync(&payload.source_device_id) {
+                                return axum::Json(
+                                    serde_json::json!({"status": "error", "message": "untrusted"}),
+                                );
+                            }
+                            let notif = crate::eco::notification::NotificationData {
+                                id: payload.notification_id,
+                                notification_key: payload.notification_key,
+                                app_package: payload.app_package,
+                                app_name: payload.app_name,
+                                title: payload.title,
+                                body: payload.body,
+                                icon: payload.icon,
+                                icon_hash: payload.icon_hash,
+                                actions: payload.actions,
+                                can_reply: payload.can_reply,
+                                messages: payload.messages,
+                                device_name: payload.source_device_name,
+                                device_id: payload.source_device_id,
+                                timestamp: payload.timestamp,
+                                read: false,
+                                replied: false,
+                            };
+                            let notif_arc = std::sync::Arc::new(notif);
+                            // See the clipboard/sync handler above: must stay on
+                            // Tokio's blocking pool (not a bare std::thread) so
+                            // any subscriber that itself calls spawn_blocking
+                            // keeps working.
+                            tokio::task::spawn_blocking(move || {
+                                // Clone out of the Arc for the event — the event
+                                // enum owns its data.
+                                let notif = (*notif_arc).clone();
+                                bus.emit(EcoEvent::NotificationReceived(
+                                    notif,
+                                    "remote".to_string(),
+                                ));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
                     }
-                }
-            }))
-            .route("/api/ecosystem/v1/notification/dismiss", axum::routing::post({
-                let bus = event_bus.clone();
-                move |body: axum::extract::Json<NotificationDismissPayload>| {
-                    let bus = bus.clone();
-                    async move {
-                        let payload = body.0;
-                        bus.emit(EcoEvent::NotificationDismissed(payload));
-                        axum::Json(serde_json::json!({"status": "ok"}))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/reply",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<NotificationReplyPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let payload = body.0;
+                            let reply = crate::eco::notification::NotificationReply {
+                                notification_id: payload.notification_id,
+                                notification_key: payload.notification_key,
+                                reply_text: payload.reply_text,
+                                source_device_id: payload.source_device_id,
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::NotificationReplied(reply));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
                     }
-                }
-            }))
-            .route("/api/ecosystem/v1/notification/action", axum::routing::post({
-                let bus = event_bus.clone();
-                move |body: axum::extract::Json<NotificationActionPayload>| {
-                    let bus = bus.clone();
-                    async move {
-                        let payload = body.0;
-                        bus.emit(EcoEvent::NotificationActionRequested(payload));
-                        axum::Json(serde_json::json!({"status": "ok"}))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/dismiss",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<NotificationDismissPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let payload = body.0;
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::NotificationDismissed(payload));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
                     }
-                }
-            }));
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/action",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<NotificationActionPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let payload = body.0;
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::NotificationActionRequested(payload));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/request",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<serde_json::Value>| {
+                        let bus = bus.clone();
+                        async move {
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::NotificationRequested);
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            );
 
         let bind_addr = *addr;
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind(bind_addr).await;
             if let Ok(listener) = listener {
-                axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await.ok();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<SocketAddr>(),
+                )
+                .await
+                .ok();
             }
         });
     }
@@ -332,11 +469,14 @@ impl DeviceDiscovery {
     /// probing but on eco's own ports, across all subnets (see `local_subnets`).
     pub async fn start_discovery(&self) {
         let known_devices = self.known_devices.clone();
+        let event_bus = self.event_bus.clone();
+        let local_id = crate::eco::pairing::get_local_device_id();
 
         tokio::spawn(async move {
             loop {
-                let local_ip = local_ip_address::local_ip()
-                    .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+                let local_ip = local_ip_address::local_ip().unwrap_or(std::net::IpAddr::V4(
+                    std::net::Ipv4Addr::new(192, 168, 1, 1),
+                ));
                 let local_ip_str = local_ip.to_string();
                 let subnets = local_subnets();
                 let scans = subnets
@@ -370,12 +510,22 @@ impl DeviceDiscovery {
                     match devices.get_mut(&id) {
                         Some(existing) => {
                             existing.last_heartbeat = now;
+                            // Refresh mutable fields so capability/config
+                            // changes on the peer are picked up promptly
+                            // (e.g. clipboard_sync toggled in runtime config).
+                            existing.device.addr = peer.addr;
+                            existing.device.capabilities = peer.capabilities.clone();
+                            existing.device.platform = peer.platform.clone();
+                            existing.device.trusted_peers = peer.trusted_peers.clone();
                         }
                         None => {
-                            devices.insert(id.clone(), DiscoveredDevice {
-                                device: peer.clone(),
-                                last_heartbeat: now,
-                            });
+                            devices.insert(
+                                id.clone(),
+                                DiscoveredDevice {
+                                    device: peer.clone(),
+                                    last_heartbeat: now,
+                                },
+                            );
                             new_count += 1;
                         }
                     }
@@ -387,18 +537,58 @@ impl DeviceDiscovery {
                             entry.hostname = peer.hostname.clone();
                             entry.ip = ip_str;
                             entry.port = port;
+                            entry.fastswap_port = peer.fastswap_port;
                             entry.is_online = true;
                             entry.last_seen_secs = 0;
+                            let mut trusted = crate::eco::pairing::is_trusted_sync(&id);
+                            // Stale trust detection: if we think this peer is
+                            // trusted but the peer's /info says it does NOT
+                            // trust us back, the peer likely restarted and lost
+                            // its trust state. Demote it locally so the UI
+                            // reflects the real state.
+                            if trusted {
+                                if let Some(ref local) = local_id {
+                                    match &peer.trusted_peers {
+                                        Some(ids) if !ids.contains(local) => {
+                                            trusted = false;
+                                            crate::eco::pairing::persist_untrust(&id);
+                                            event_bus.emit(EcoEvent::DeviceUntrusted(
+                                                std::sync::Arc::new(peer.clone()),
+                                            ));
+                                        }
+                                        None => {} // old binary, skip check
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            entry.is_trusted = trusted;
                             entry.is_mobile = peer.platform.eq_ignore_ascii_case("mobile");
                         }
                         None => {
+                            let mut trusted = crate::eco::pairing::is_trusted_sync(&id);
+                            if trusted {
+                                if let Some(ref local) = local_id {
+                                    match &peer.trusted_peers {
+                                        Some(ids) if !ids.contains(local) => {
+                                            trusted = false;
+                                            crate::eco::pairing::persist_untrust(&id);
+                                            event_bus.emit(EcoEvent::DeviceUntrusted(
+                                                std::sync::Arc::new(peer.clone()),
+                                            ));
+                                        }
+                                        None => {}
+                                        _ => {}
+                                    }
+                                }
+                            }
                             network_list.push(DiscoveredEcoDevice {
                                 id: id.clone(),
                                 name: peer.name.clone(),
                                 hostname: peer.hostname.clone(),
                                 ip: ip_str,
                                 port,
-                                is_trusted: crate::eco::pairing::is_trusted_sync(&id),
+                                fastswap_port: peer.fastswap_port,
+                                is_trusted: trusted,
                                 is_online: true,
                                 last_seen_secs: 0,
                                 is_mobile: peer.platform.eq_ignore_ascii_case("mobile"),
@@ -444,11 +634,13 @@ impl DeviceDiscovery {
         match client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    let device_id = body.get("device_id")
+                    let device_id = body
+                        .get("device_id")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let device_name = body.get("device_name")
+                    let device_name = body
+                        .get("device_name")
                         .and_then(|v| v.as_str())
                         .unwrap_or(&format!("eco-{}", ip))
                         .to_string();
@@ -457,14 +649,17 @@ impl DeviceDiscovery {
                     }
                     let uuid = match uuid::Uuid::parse_str(&device_id) {
                         Ok(u) => u,
-                        Err(_) => uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, device_id.as_bytes()),
+                        Err(_) => {
+                            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, device_id.as_bytes())
+                        }
                     };
                     let mut eco = EcoDevice::new(device_name);
                     eco.id = uuid;
                     if let Ok(ip_addr) = ip.parse::<std::net::IpAddr>() {
-                        eco.addr = Some(SocketAddr::new(ip_addr, ECO_TLS_PORT));
+                        eco.addr = Some(SocketAddr::new(ip_addr, port));
                     }
-                    eco.hostname = body.get("device_model")
+                    eco.hostname = body
+                        .get("device_model")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
@@ -472,7 +667,8 @@ impl DeviceDiscovery {
                     // so the keep-alive tier can gate on mobile peers. Overwrites
                     // the EcoDevice::new default (which is the *local* OS) — a
                     // desktop peer omits both keys and stays non-mobile ("").
-                    eco.platform = body.get("device_type")
+                    eco.platform = body
+                        .get("device_type")
                         .or_else(|| body.get("platform"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
@@ -482,6 +678,24 @@ impl DeviceDiscovery {
                         .get("notification_sync")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    // Peer's self-reported trusted device list — used to detect
+                    // stale trust (e.g. desktop restarted and lost trust).
+                    eco.trusted_peers =
+                        body.get("trusted_peers")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            });
+                    // Advertised FastSwap TLS port (53318 default; drifts when
+                    // 53317 is taken). send_files uses this instead of a
+                    // hardcoded constant so transfers survive port drift.
+                    eco.fastswap_port = body
+                        .get("fastswap_port")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| p as u16)
+                        .unwrap_or(0);
                     Some(eco)
                 } else {
                     None
@@ -495,7 +709,11 @@ impl DeviceDiscovery {
     /// (53328) port. Skips every local interface address so the probe host
     /// never discovers itself (see `local_ipv4s`).
     async fn scan_subnet(subnet: &str, use_tls: bool) -> Vec<EcoDevice> {
-        let port = if use_tls { ECO_TLS_PORT } else { DEFAULT_ECO_PORT };
+        let port = if use_tls {
+            ECO_TLS_PORT
+        } else {
+            DEFAULT_ECO_PORT
+        };
         let self_ips: std::collections::HashSet<std::net::Ipv4Addr> =
             local_ipv4s().into_iter().collect();
 
@@ -510,9 +728,7 @@ impl DeviceDiscovery {
                 }
             }
 
-            let task = tokio::spawn(async move {
-                Self::probe_ip(&ip, port, use_tls).await
-            });
+            let task = tokio::spawn(async move { Self::probe_ip(&ip, port, use_tls).await });
             tasks.push(task);
 
             if tasks.len() >= 50 {
@@ -534,9 +750,8 @@ impl DeviceDiscovery {
     pub async fn run_cleanup(&self) {
         let known_devices = self.known_devices.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_secs(DEVICE_TIMEOUT_SECS / 2)
-            );
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(DEVICE_TIMEOUT_SECS / 2));
             loop {
                 interval.tick().await;
                 let mut devices = known_devices.write().await;
@@ -544,7 +759,11 @@ impl DeviceDiscovery {
                 devices.retain(|id, d| {
                     let keep = now.duration_since(d.last_heartbeat).as_secs() < DEVICE_TIMEOUT_SECS;
                     if !keep {
-                        tracing::info!("[ECO] cleanup: dropped {} (no heartbeat {}s)", id, DEVICE_TIMEOUT_SECS);
+                        tracing::info!(
+                            "[ECO] cleanup: dropped {} (no heartbeat {}s)",
+                            id,
+                            DEVICE_TIMEOUT_SECS
+                        );
                     }
                     keep
                 });

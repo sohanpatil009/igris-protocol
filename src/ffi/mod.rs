@@ -565,22 +565,9 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
             let local_name = crate::eco::pairing::get_local_device_name()
                 .ok_or_else(|| FfiError::Message("local identity not set".to_string()))?;
 
-            let addr = peer
-                .ip
-                .parse::<std::net::IpAddr>()
-                .map_err(err)
-                .map(|ip| std::net::SocketAddr::new(ip, crate::eco::constants::ECO_TLS_PORT))?;
-            let transport = crate::eco::transport::EcoTransport::new();
-            transport
-                .send_pair_request(
-                    &addr,
-                    &local_id,
-                    &local_name,
-                    crate::eco::constants::ECO_TLS_PORT,
-                )
-                .await
-                .map_err(err)?;
-
+            // Persist trust BEFORE sending the request so that our /info
+            // includes this device in trusted_peers immediately — prevents
+            // the peer's stale-trust detection from unlinking us.
             if let Some(manager) = crate::eco::pairing::get_pairing_manager() {
                 if let Some(mgr) = manager.as_ref() {
                     mgr.trust_device_direct(&peer.id).await.map_err(err)?;
@@ -592,6 +579,28 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
                     d.is_trusted = true;
                 }
             }
+
+            // Use the peer's actual discovered address (port-aware) instead
+            // of hardcoding ECO_TLS_PORT which fails for HTTP-only peers.
+            let addr = peer
+                .ip
+                .parse::<std::net::IpAddr>()
+                .map_err(err)
+                .map(|ip| {
+                    let port = peer.port;
+                    std::net::SocketAddr::new(ip, port)
+                })?;
+            let transport = crate::eco::transport::EcoTransport::new();
+            transport
+                .send_pair_request(
+                    &addr,
+                    &local_id,
+                    &local_name,
+                    crate::eco::constants::DEFAULT_ECO_PORT,
+                )
+                .await
+                .map_err(err)?;
+
             self.event_bus
                 .emit(crate::eco::events::EcoEvent::DeviceTrusted(Arc::new(
                     eco_device_of(&peer),
@@ -931,7 +940,11 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
                     crate::fastswap::models::DeviceType::Desktop
                 },
                 ip: peer.ip.clone(),
-                port: crate::fastswap::FASTSWAP_TLS_PORT,
+                port: if peer.fastswap_port > 0 {
+                    peer.fastswap_port
+                } else {
+                    crate::fastswap::FASTSWAP_TLS_PORT
+                },
                 protocol: "2.0".to_string(),
                 download: true,
             };

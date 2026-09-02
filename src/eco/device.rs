@@ -41,6 +41,16 @@ pub struct EcoDevice {
     pub addr: Option<SocketAddr>,
     #[serde(skip)]
     pub last_seen: Option<Instant>,
+    /// Peer's self-reported list of trusted device IDs (from `/info`).
+    /// `None` = peer is an old binary that doesn't report this field.
+    /// `Some([])` = peer reports it has no trusted peers (stale trust).
+    #[serde(default)]
+    pub trusted_peers: Option<Vec<String>>,
+    /// Peer's advertised FastSwap (LocalSend v2) TLS port, from `/info`
+    /// `fastswap_port`. 0 = peer is an old binary that didn't report it;
+    /// callers should fall back to FASTSWAP_TLS_PORT (53318).
+    #[serde(default)]
+    pub fastswap_port: u16,
 }
 
 impl EcoDevice {
@@ -56,6 +66,8 @@ impl EcoDevice {
             public_key: None,
             addr: None,
             last_seen: Some(Instant::now()),
+            trusted_peers: None,
+            fastswap_port: 0,
         }
     }
 

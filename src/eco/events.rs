@@ -22,6 +22,8 @@ pub enum EcoEvent {
     NotificationDismissed(NotificationDismissPayload),
     /// A peer wants us to fire one of the notification's action buttons.
     NotificationActionRequested(NotificationActionPayload),
+    /// A peer requests all active notifications (initial sync on connect).
+    NotificationRequested,
 
     PairingRequest(Arc<EcoDevice>),
     PairingAccepted(Arc<EcoDevice>),
