@@ -68,6 +68,12 @@ pub struct NodeConfig {
     pub serve_plain_http: bool,
     pub clipboard_enabled: bool,
     pub notification_enabled: bool,
+    #[uniffi(default = false)]
+    pub call_enabled: bool,
+    #[uniffi(default = false)]
+    pub sms_enabled: bool,
+    #[uniffi(default = false)]
+    pub clipboard_media_enabled: bool,
 }
 
 /// Snapshot of a peer seen on the LAN (eco discovery + pairing).
@@ -163,7 +169,7 @@ pub struct OutgoingFile {
     pub relative_path: String,
 }
 
-/// Clipboard payload moved across devices.
+/// Clipboard payload moved across devices (enterprise: text or base64 media).
 #[derive(uniffi::Record)]
 pub struct ClipboardDataInfo {
     pub content: String,
@@ -171,6 +177,10 @@ pub struct ClipboardDataInfo {
     pub content_hash: String,
     pub source_device: String,
     pub timestamp: i64,
+    pub encoding: String,
+    pub file_name: String,
+    pub mime_type: String,
+    pub byte_size: u64,
 }
 
 /// Raw notification handed back from the platform (used by the
@@ -184,6 +194,42 @@ pub struct RawNotificationInfo {
     pub timestamp: i64,
 }
 
+/// Enterprise call event (Igris native).
+#[derive(uniffi::Record)]
+pub struct CallInfo {
+    pub call_id: String,
+    pub event: String,
+    pub phone_number: String,
+    pub contact_name: String,
+    pub device_name: String,
+    pub device_id: String,
+    pub timestamp: i64,
+}
+
+/// One call-history row pushed from the phone's call log to linked peers.
+#[derive(uniffi::Record)]
+pub struct CallLogEntryInfo {
+    pub call_id: String,
+    pub event: String,
+    pub phone_number: String,
+    pub contact_name: String,
+    pub timestamp: i64,
+    pub duration_seconds: i64,
+    pub call_type: String,
+}
+
+/// Enterprise SMS (Igris native).
+#[derive(uniffi::Record)]
+pub struct SmsInfo {
+    pub sms_id: String,
+    pub thread_id: String,
+    pub address: String,
+    pub body: String,
+    pub date: i64,
+    pub device_name: String,
+    pub device_id: String,
+}
+
 // ---------------------------------------------------------------------------
 // Callback interfaces (implemented in Kotlin)
 // ---------------------------------------------------------------------------
@@ -194,6 +240,20 @@ pub struct RawNotificationInfo {
 pub trait ClipboardProvider: Send + Sync {
     fn get_text(&self) -> FfiResult<String>;
     fn set_text(&self, text: String) -> FfiResult<()>;
+}
+
+/// Platform contacts, injected by the host. Backed by the phonebook
+/// ContentProvider on Android; queried per keystroke (debounced by UI).
+#[uniffi::export(foreign)]
+pub trait ContactProvider: Send + Sync {
+    fn search_contacts(&self, query: String, limit: u32) -> Vec<ContactHitInfo>;
+}
+
+/// A phonebook hit (name + callable number) from the host provider.
+#[derive(uniffi::Record)]
+pub struct ContactHitInfo {
+    pub name: String,
+    pub number: String,
 }
 
 /// Platform notification access, injected by the host. On Android,
@@ -225,8 +285,22 @@ pub trait NodeEventListener: Send + Sync {
     fn on_notification_action_requested(&self, key: String, action_index: u32);
     /// A peer dismissed our notification `key` — cancel it locally.
     fn on_notification_dismiss_requested(&self, key: String);
+    fn on_call_received(&self, call: CallInfo);
+    fn on_sms_received(&self, sms: SmsInfo);
+    /// A peer sent a call control action: mute | accept | decline | end |
+    /// dial (dial carries the target number). The host executes it against
+    /// the telecom stack.
+    fn on_call_action(&self, call_id: String, action: String, phone_number: String);
+    /// A peer asks this device to transmit an SMS via its SIM slot.
+    fn on_sms_send_requested(&self, address: String, body: String);
     fn on_transfer_request(&self, transfer: IncomingTransfer);
     fn on_transfer_progress(&self, progress: TransferProgressInfo);
+    /// LAN audio session: peer frames arrived (s16le mono at the
+    /// negotiated rate). The host should feed its playback path.
+    fn on_audio_frame(&self, frame: Vec<u8>);
+    /// LAN audio session opened/closed (`"true"` / `"false"` opens/closes
+    /// the host's capture + playback engine).
+    fn on_audio_stream_state(&self, state: String);
     fn on_log(&self, message: String);
 }
 
@@ -286,6 +360,28 @@ impl PlatformNotification for NotificationProviderAdapter {
         self.inner
             .request_permission()
             .map_err(|e| crate::eco::errors::EcoError::Notification(e.to_string()))
+    }
+}
+
+struct ContactProviderAdapter {
+    inner: Arc<dyn ContactProvider>,
+}
+
+impl crate::platform::ecosystem::PlatformContacts for ContactProviderAdapter {
+    fn search(
+        &self,
+        query: &str,
+        limit: u32,
+    ) -> crate::eco::errors::EcoResult<Vec<crate::platform::ecosystem::ContactEntry>> {
+        Ok(self
+            .inner
+            .search_contacts(query.to_string(), limit)
+            .into_iter()
+            .map(|h| crate::platform::ecosystem::ContactEntry {
+                name: h.name,
+                number: h.number,
+            })
+            .collect())
     }
 }
 
@@ -374,6 +470,34 @@ fn clipboard_info_of(data: &crate::eco::clipboard::ClipboardData) -> ClipboardDa
         content_hash: data.content_hash.clone(),
         source_device: data.source_device.clone(),
         timestamp: data.timestamp,
+        encoding: data.encoding.clone(),
+        file_name: data.file_name.clone(),
+        mime_type: data.mime_type.clone(),
+        byte_size: data.byte_size,
+    }
+}
+
+fn call_info_of(c: &crate::eco::call::CallData) -> CallInfo {
+    CallInfo {
+        call_id: c.call_id.clone(),
+        event: c.event.clone(),
+        phone_number: c.phone_number.clone(),
+        contact_name: c.contact_name.clone(),
+        device_name: c.device_name.clone(),
+        device_id: c.device_id.clone(),
+        timestamp: c.timestamp,
+    }
+}
+
+fn sms_info_of(s: &crate::eco::sms::SmsData) -> SmsInfo {
+    SmsInfo {
+        sms_id: s.sms_id.clone(),
+        thread_id: s.thread_id.clone(),
+        address: s.address.clone(),
+        body: s.body.clone(),
+        date: s.date,
+        device_name: s.device_name.clone(),
+        device_id: s.device_id.clone(),
     }
 }
 
@@ -389,6 +513,7 @@ pub struct EcosystemNode {
     manager: std::sync::Mutex<EcoManager>,
     event_bus: Arc<EventBus>,
     listener: Option<Arc<dyn NodeEventListener>>,
+    audio_link: Arc<crate::eco::audio_net::ActiveLink>,
 }
 
 #[uniffi::export]
@@ -400,6 +525,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
         config: NodeConfig,
         clipboard_provider: Arc<dyn ClipboardProvider>,
         notification_provider: Arc<dyn NotificationProvider>,
+        contact_provider: Arc<dyn ContactProvider>,
         listener: Option<Arc<dyn NodeEventListener>>,
     ) -> FfiResult<Arc<Self>> {
         #[cfg(target_os = "android")]
@@ -420,6 +546,9 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
             cfg.enabled = true;
             cfg.clipboard_sync = config.clipboard_enabled;
             cfg.notification_sync = config.notification_enabled;
+            cfg.call_sync = config.call_enabled;
+            cfg.sms_sync = config.sms_enabled;
+            cfg.clipboard_media = config.clipboard_media_enabled;
             cfg.device_name = config.name.clone();
         }
 
@@ -448,6 +577,9 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
         let notification = NotificationProviderAdapter {
             inner: notification_provider,
         };
+        crate::platform::ecosystem::set_contacts_provider(Box::new(ContactProviderAdapter {
+            inner: contact_provider,
+        }));
 
         let event_bus: Arc<EventBus>;
         {
@@ -467,11 +599,12 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
             manager: std::sync::Mutex::new(manager),
             event_bus,
             listener,
+            audio_link: Arc::new(crate::eco::audio_net::ActiveLink::new()),
         }))
     }
 
     /// Bind the eco HTTP/TLS ports, start discovery, the notification/clipboard
-    /// sync loops, and the FastSwap (LocalSend v2) server so the phone is
+    /// sync loops, and the FastSwap native server so the phone is
     /// discoverable on both protocols.
     pub fn start(&self) -> FfiResult<()> {
         {
@@ -499,7 +632,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
             device_type: crate::fastswap::models::DeviceType::Mobile,
             ip: local_ip,
             port: 53317,
-            protocol: "2.0".to_string(),
+            protocol: "1.0".to_string(),
             download: true,
         };
         if let Ok(mut guard) = crate::fastswap::FASTSWAP_DEVICE.lock() {
@@ -522,6 +655,44 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
         }
 
         self.runtime.block_on(crate::fastswap::start_on_demand());
+
+        // LAN audio channel: passive listener on the audio port; a trusted
+        // desktop-initiated link opens the duplex session (its mic and
+        // speaker ride the same socket both ways). Frames cross the FFI
+        // boundary through the callback layer below.
+        let audio_on_frame = self.listener.clone();
+        let audio_on_state = self.listener.clone();
+        let is_trusted: crate::eco::audio_net::TrustedIp = Arc::new(move |ip: std::net::IpAddr| {
+            let ip_str = ip.to_string();
+            if let Ok(net) = crate::eco::discovery::ECO_NETWORK_DEVICES.try_read() {
+                let check = net.iter().any(|d| d.is_trusted && d.ip == ip_str);
+                let table = net
+                    .iter()
+                    .map(|d| format!("{}@{}:{}", d.name, d.ip, d.is_trusted))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                tracing::info!("[ECO] audio trust: {ip_str} -> {check} [{table}]");
+                check
+            } else {
+                tracing::info!("[ECO] audio trust: {ip_str} -> devices lock busy");
+                false
+            }
+        });
+        let node_link = self.audio_link.clone();
+        self.runtime.spawn(crate::eco::audio_net::listen(
+            node_link,
+            is_trusted,
+            Arc::new(move |frame| {
+                if let Some(l) = &audio_on_frame {
+                    l.on_audio_frame(frame);
+                }
+            }),
+            Arc::new(move |active| {
+                if let Some(l) = &audio_on_state {
+                    l.on_audio_stream_state(active.to_string());
+                }
+            }),
+        ));
 
         Ok(())
     }
@@ -710,7 +881,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
     /// into the core: keyed dedup (updates in place), history, event, then
     /// fan-out to trusted peers with the `notification_sync` capability over
     /// `/notification/sync`. Icon bytes are skipped per-peer when the hash is
-    /// unchanged (KDE-style); `icon_hash` is still sent so the peer can cache.
+    /// unchanged (hash-skip); `icon_hash` is still sent so the peer can cache.
     pub fn push_notification_rich(&self, rich: RichNotificationInfo) -> FfiResult<()> {
         self.runtime.block_on(async {
             let (notif, is_update) = {
@@ -793,7 +964,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
                     source_device_name: notif.device_name.clone(),
                     timestamp: notif.timestamp,
                 };
-                // KDE-style icon dedup: skip the bytes when this peer already
+                // Icon dedup: skip the bytes when this peer already
                 // saw this hash for this key.
                 let send_icon = {
                     let manager = self.manager.lock().map_err(err)?;
@@ -914,7 +1085,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
     }
 
     /// Send staged files (absolute paths, e.g. `cacheDir/outbox/...`) to the
-    /// peer at `host` over FastSwap (LocalSend v2 three-way handshake +
+    /// peer at `host` over FastSwap native three-way handshake +
     /// parallel uploads). Returns the local session id for progress tracking.
     /// Long-running — call from a background thread.
     pub fn send_files(&self, host: String, files: Vec<OutgoingFile>) -> FfiResult<String> {
@@ -945,7 +1116,7 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
                 } else {
                     crate::fastswap::FASTSWAP_TLS_PORT
                 },
-                protocol: "2.0".to_string(),
+                protocol: "1.0".to_string(),
                 download: true,
             };
 
@@ -1015,6 +1186,234 @@ impl EcosystemNode {    /// Build the node: apply config, override identity, ini
             .map(|g| g.get_notifications().iter().map(notification_info_of).collect())
             .unwrap_or_default()
     }
+
+    pub fn get_calls(&self) -> Vec<CallInfo> {
+        self.manager
+            .lock()
+            .map(|g| g.get_calls().iter().map(call_info_of).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_sms(&self) -> Vec<SmsInfo> {
+        self.manager
+            .lock()
+            .map(|g| g.get_sms().iter().map(sms_info_of).collect())
+            .unwrap_or_default()
+    }
+
+    /// Enterprise: push a local call event and fan-out to trusted peers.
+    pub fn push_call(&self, call_id: String, event: String, phone_number: String, contact_name: String) -> FfiResult<()> {
+        self.runtime.block_on(async {
+            let (data, targets) = {
+                let manager = self.manager.lock().map_err(err)?;
+                let call = manager.call_manager().ok_or_else(|| FfiError::Message("call manager not ready".to_string()))?;
+                let mut guard = call.lock().map_err(|_| FfiError::Message("call lock failed".to_string()))?;
+                let data = guard.push_local(call_id, event, phone_number, contact_name);
+                crate::eco::call::set_calls(guard.get_calls());
+                let targets = trusted_addrs().await;
+                (data, targets)
+            };
+            // Audio-routing decisions ride the local call-event stream: a
+            // pending desktop-initiated route applies the moment the line is
+            // actually live and clears when it ends. The OS-level switch
+            // itself lives in the platform executor (the sensor/API layer).
+            let decision = crate::eco::audio::on_call_event(&data.event);
+            if decision != crate::eco::audio::AudioRouteDecision::None {
+                if let Some(listener) = &self.listener {
+                    let action = match decision {
+                        crate::eco::audio::AudioRouteDecision::Apply => "audio",
+                        crate::eco::audio::AudioRouteDecision::Clear => "audio_off",
+                        crate::eco::audio::AudioRouteDecision::None => unreachable!(),
+                    };
+                    listener.on_call_action(data.call_id.clone(), action.to_string(), String::new());
+                }
+            }
+            let transport = crate::eco::transport::EcoTransport::new();
+            let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+            let local_name = crate::eco::pairing::get_local_device_name().unwrap_or_default();
+            for addr in targets {
+                let payload = crate::eco::protocol::CallSyncPayload {
+                    call_id: data.call_id.clone(),
+                    event: data.event.clone(),
+                    phone_number: data.phone_number.clone(),
+                    contact_name: data.contact_name.clone(),
+                    contact_thumbnail_hash: String::new(),
+                    source_device_id: local_id.clone(),
+                    source_device_name: local_name.clone(),
+                    timestamp: data.timestamp,
+                    is_cancel: false,
+                };
+                let _ = transport.send_call(&addr, &payload).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Enterprise: push a call-log snapshot (the phone's call history) to
+    /// trusted peers so the desktop mirrors it. Deduped peer-side by
+    /// `call_id`; call once per connect, not per row.
+    pub fn push_call_log(&self, entries: Vec<CallLogEntryInfo>) -> FfiResult<()> {
+        self.runtime.block_on(async {
+            let targets = trusted_addrs().await;
+            if targets.is_empty() {
+                return Ok(());
+            }
+            let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+            let local_name = crate::eco::pairing::get_local_device_name().unwrap_or_default();
+            let payload = crate::eco::protocol::CallLogSyncPayload {
+                calls: entries
+                    .into_iter()
+                    .map(|e| crate::eco::protocol::CallLogEntry {
+                        call_id: e.call_id,
+                        event: e.event,
+                        phone_number: e.phone_number,
+                        contact_name: e.contact_name,
+                        device_name: local_name.clone(),
+                        device_id: local_id.clone(),
+                        timestamp: e.timestamp,
+                        duration_seconds: e.duration_seconds,
+                        call_type: e.call_type,
+                        is_cancel: false,
+                    })
+                    .collect(),
+                source_device_id: local_id,
+                source_device_name: local_name,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            let transport = crate::eco::transport::EcoTransport::new();
+            for addr in targets {
+                let _ = transport.send_call_log_sync(&addr, &payload).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Enterprise: push a local SMS and fan-out to trusted peers.
+    pub fn push_sms(&self, sms_id: String, thread_id: String, address: String, body: String) -> FfiResult<()> {
+        self.runtime.block_on(async {
+            let (data, targets) = {
+                let manager = self.manager.lock().map_err(err)?;
+                let sms = manager.sms_manager().ok_or_else(|| FfiError::Message("sms manager not ready".to_string()))?;
+                let mut guard = sms.lock().map_err(|_| FfiError::Message("sms lock failed".to_string()))?;
+                let data = guard.push_local(sms_id, thread_id, address, body);
+                crate::eco::sms::set_sms(guard.get_messages());
+                let targets = trusted_addrs().await;
+                (data, targets)
+            };
+            let transport = crate::eco::transport::EcoTransport::new();
+            let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+            let local_name = crate::eco::pairing::get_local_device_name().unwrap_or_default();
+            for addr in targets {
+                let payload = crate::eco::protocol::SmsSyncPayload {
+                    sms_id: data.sms_id.clone(),
+                    thread_id: data.thread_id.clone(),
+                    address: data.address.clone(),
+                    body: data.body.clone(),
+                    date: data.date,
+                    read: false,
+                    sub_id: 0,
+                    source_device_id: local_id.clone(),
+                    source_device_name: local_name.clone(),
+                    timestamp: data.timestamp,
+                };
+                let _ = transport.send_sms(&addr, &payload).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// Enterprise: reply to a mirrored notification straight from the
+    /// system shade (no app open). Routes to the originating device.
+    pub fn reply_notification(&self, device_id: String, key: String, text: String) -> FfiResult<()> {
+        if text.trim().is_empty() {
+            return Err(FfiError::Message("empty reply".to_string()));
+        }
+        self.runtime.block_on(async {
+            let addr = {
+                let net = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+                net.iter()
+                    .find(|d| d.id == device_id)
+                    .cloned()
+                    .and_then(|d| {
+                        d.ip.parse::<std::net::IpAddr>()
+                            .ok()
+                            .map(|ip| std::net::SocketAddr::new(ip, d.port))
+                    })
+                    .ok_or_else(|| FfiError::Message("no route to device".to_string()))
+            }?;
+            let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+            let payload = crate::eco::protocol::NotificationReplyPayload {
+                notification_id: key.clone(),
+                notification_key: key,
+                reply_text: text,
+                source_device_id: local_id,
+            };
+            crate::eco::transport::EcoTransport::new()
+                .send_notification_reply(&addr, &payload)
+                .await
+                .map_err(err)
+        })
+    }
+
+    /// Enterprise: send a call control action to trusted peers.
+    /// `dial` carries its target number (desk-initiated outgoing call).
+    pub fn call_action(&self, call_id: String, action: String, phone_number: String) -> FfiResult<()> {
+        self.runtime.block_on(async {
+            let targets = trusted_addrs().await;
+            let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+            let transport = crate::eco::transport::EcoTransport::new();
+            for addr in targets {
+                let payload = crate::eco::protocol::CallActionPayload {
+                    call_id: call_id.clone(),
+                    action: action.clone(),
+                    source_device_id: local_id.clone(),
+                    phone_number: phone_number.clone(),
+                    contact_name: String::new(),
+                };
+                let _ = transport.send_call_action(&addr, &payload).await;
+            }
+            Ok(())
+        })
+    }
+
+    /// LAN audio: host capture loop pushes one raw frame batch (a
+    /// multiple of the negotiated frame size) to the linked peer.
+    pub fn send_audio_frame(&self, frames: Vec<u8>) -> FfiResult<()> {
+        if !self.audio_link.send(frames) {
+            // No active link or a size mismatch: realtime drop, not an error.
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    /// Enterprise both-ways: pull peer backlog after connect.
+    pub fn sync_peer_lists(&self, host: String) -> FfiResult<String> {
+        self.runtime.block_on(async {
+            let peer = {
+                let devices = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+                devices.iter().find(|d| d.ip == host).cloned()
+            };
+            let peer = peer.ok_or_else(|| FfiError::Message(format!("no device at {host}")))?;
+            let addr = peer.ip.parse::<std::net::IpAddr>().map_err(err)
+                .map(|ip| std::net::SocketAddr::new(ip, peer.port))?;
+            let transport = crate::eco::transport::EcoTransport::new();
+            let remote = transport.request_notifications(&addr).await.map_err(err)?;
+            Ok(format!("pulled {} notifications", remote.len()))
+        })
+    }
+}
+
+async fn trusted_addrs() -> Vec<std::net::SocketAddr> {
+    let trusted: std::collections::HashSet<String> = {
+        let net = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+        net.iter().filter(|d| d.is_trusted).map(|d| d.id.clone()).collect()
+    };
+    // Resolve via global manager discovery is not available here; use network list addrs.
+    let net = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+    net.iter()
+        .filter(|d| trusted.contains(&d.id))
+        .filter_map(|d| d.ip.parse::<std::net::IpAddr>().ok().map(|ip| std::net::SocketAddr::new(ip, d.port)))
+        .collect()
 }
 
 fn bridge_event(listener: &Arc<dyn NodeEventListener>, event: EcoEvent) {
@@ -1047,6 +1446,22 @@ fn bridge_event(listener: &Arc<dyn NodeEventListener>, event: EcoEvent) {
         }
         EcoEvent::NotificationActionRequested(payload) => {
             listener.on_notification_action_requested(payload.notification_key, payload.action_index);
+        }
+        EcoEvent::CallReceived(data) => {
+            listener.on_call_received(call_info_of(&data));
+        }
+        EcoEvent::SmsReceived(data) => {
+            listener.on_sms_received(sms_info_of(&data));
+        }
+        EcoEvent::SmsSendRequested { address, body } => {
+            listener.on_sms_send_requested(address, body);
+        }
+        EcoEvent::CallActionRequested(payload) => {
+            listener.on_call_action(
+                payload.call_id,
+                payload.action,
+                payload.phone_number,
+            );
         }
         EcoEvent::Error(msg) | EcoEvent::Synced(msg) => {
             listener.on_log(msg);

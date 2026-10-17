@@ -94,6 +94,10 @@ impl SyncManager {
                         content_type: data.content_type.clone(),
                         source_device: sender_id.clone(),
                         timestamp: chrono::Utc::now().timestamp_millis(),
+                        encoding: data.encoding.clone(),
+                        file_name: data.file_name.clone(),
+                        mime_type: data.mime_type.clone(),
+                        byte_size: data.byte_size,
                     };
 
                     tracing::info!("[ECO] Broadcasting clipboard to {} linked peer(s)", targets.len());

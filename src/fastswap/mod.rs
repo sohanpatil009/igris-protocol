@@ -1,5 +1,4 @@
-// FastSwap integration module for IGRIS
-// Based on localshare-desktop implementation
+// FastSwap integration module for IGRIS (native enterprise transfer)
 
 pub mod models;
 pub mod network;
@@ -232,6 +231,16 @@ impl FastSwapManager {
 
         self.server_handle = Some(proxy_handle);
         self.port = http_port;
+
+        // Keep the advertised local device in sync with the port we actually
+        // bound (`start_server` falls back up the range when 53317 is taken).
+        // `/info` and `register` report this to peers — leaving the
+        // hard-coded 53317 advertises a dead port after a fallback bind.
+        if let Ok(mut dev_guard) = FASTSWAP_DEVICE.lock() {
+            if let Some(dev) = dev_guard.as_mut() {
+                dev.port = http_port;
+            }
+        }
 
         tracing::info!("[FastSwap] HTTP:{}, TLS:{}", http_port, tls_port);
         Ok(())

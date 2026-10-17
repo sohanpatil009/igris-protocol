@@ -8,6 +8,12 @@ pub struct EcosystemConfig {
     pub auto_discovery: bool,
     pub clipboard_sync: bool,
     pub notification_sync: bool,
+    #[serde(default)]
+    pub call_sync: bool,
+    #[serde(default)]
+    pub sms_sync: bool,
+    #[serde(default)]
+    pub clipboard_media: bool,
     pub device_name: String,
     pub storage_dir: PathBuf,
 }
@@ -20,6 +26,9 @@ impl Default for EcosystemConfig {
             auto_discovery: true,
             clipboard_sync: false,
             notification_sync: false,
+            call_sync: false,
+            sms_sync: false,
+            clipboard_media: false,
             device_name: whoami::fallible::hostname().unwrap_or_default(),
             storage_dir: PathBuf::from("pkg").join(crate::eco::constants::ECO_STORAGE_DIR),
         }

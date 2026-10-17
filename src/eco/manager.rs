@@ -1,3 +1,4 @@
+use crate::eco::call::{CallManager, CallLogManager};
 use crate::eco::clipboard::{ClipboardData, ClipboardManager};
 use crate::eco::config::EcosystemConfig;
 use crate::eco::constants::*;
@@ -8,6 +9,7 @@ use crate::eco::errors::{EcoError, EcoResult};
 use crate::eco::events::{EcoEvent, EventBus};
 use crate::eco::notification::{NotificationManager, NOTIFICATION_HISTORY};
 use crate::eco::permissions::EcoPermissions;
+use crate::eco::sms::SmsManager;
 use crate::eco::storage::EcoStorage;
 use crate::eco::sync::SyncManager;
 use crate::eco::transport::EcoTransport;
@@ -26,6 +28,9 @@ pub struct EcoManager {
     discovery: Option<Arc<DeviceDiscovery>>,
     clipboard: Option<Arc<std::sync::Mutex<ClipboardManager>>>,
     notification: Option<Arc<std::sync::Mutex<NotificationManager>>>,
+    call: Option<Arc<std::sync::Mutex<CallManager>>>,
+    call_log: Option<Arc<std::sync::Mutex<CallLogManager>>>,
+    sms: Option<Arc<std::sync::Mutex<SmsManager>>>,
     storage: Arc<std::sync::Mutex<EcoStorage>>,
     permissions: Option<Arc<EcoPermissions>>,
     crypto: Option<EcoCrypto>,
@@ -56,6 +61,9 @@ impl EcoManager {
             discovery: None,
             clipboard: None,
             notification: None,
+            call: None,
+            call_log: None,
+            sms: None,
             storage,
             permissions: None,
             crypto: None,
@@ -92,8 +100,32 @@ impl EcoManager {
             device.capabilities = Capabilities {
                 clipboard_sync: self.config.clipboard_sync,
                 notification_sync: self.config.notification_sync,
+                call_sync: self.config.call_sync,
+                sms_sync: self.config.sms_sync,
+                clipboard_media: self.config.clipboard_media,
                 ..Default::default()
             };
+
+            // Stable identity across restarts (desktop builds). Peers key
+            // their trust store by device id; a fresh random UUID per launch
+            // silently breaks every existing link until re-paired. The
+            // phone's id is managed by its own IdentityStore (injected via
+            // the FFI node config) and must NOT be re-generated here.
+            #[cfg(not(target_os = "android"))]
+            {
+                let id_file = pkg_dir.join("device_id");
+                match std::fs::read_to_string(&id_file)
+                    .ok()
+                    .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+                {
+                    Some(id) => device.id = id,
+                    None => {
+                        if let Err(e) = std::fs::write(&id_file, device.id.to_string()) {
+                            tracing::warn!("[ECO] could not persist device id: {}", e);
+                        }
+                    }
+                }
+            }
         }
 
         let permissions = EcoPermissions::new(
@@ -122,6 +154,28 @@ impl EcoManager {
             device_name,
         );
         self.notification = Some(Arc::new(std::sync::Mutex::new(notification)));
+
+        // Enterprise call + SMS managers (Igris native, persisted history).
+        let (device_id2, device_name2) = {
+            let device = self.local_device.read().await;
+            (device.id.to_string(), device.name.clone())
+        };
+        let call = CallManager::new(
+            self.event_bus.clone(),
+            pkg_dir,
+            device_id2.clone(),
+            device_name2.clone(),
+        );
+        self.call = Some(Arc::new(std::sync::Mutex::new(call)));
+        let call_log = CallLogManager::new();
+        self.call_log = Some(Arc::new(std::sync::Mutex::new(call_log)));
+        let sms = SmsManager::new(
+            self.event_bus.clone(),
+            pkg_dir,
+            device_id2,
+            device_name2,
+        );
+        self.sms = Some(Arc::new(std::sync::Mutex::new(sms)));
 
         self.initialized = true;
         self.running = false;
@@ -217,6 +271,16 @@ impl EcoManager {
                 if let EcoEvent::ClipboardReceived(data, _from) = event {
                     let hash_short = if data.content_hash.len() >= 16 { &data.content_hash[..16] } else { &data.content_hash };
                     println!("[ECO] Applying received clipboard (hash={})", hash_short);
+                    // Claim synchronously (before any thread hop) so the 1s
+                    // poll loop cannot read the incoming text first and echo
+                    // it back as a local change.
+                    let claimed = manager_ptr
+                        .lock()
+                        .map(|mut guard| guard.claim_remote(&data))
+                        .unwrap_or(false);
+                    if !claimed {
+                        return;
+                    }
                     let manager = manager_ptr.clone();
                     // Use spawn_blocking: std::sync::Mutex::lock() blocks the
                     // current thread; must never run on the tokio runtime.
@@ -225,14 +289,12 @@ impl EcoManager {
                             Ok(g) => g,
                             Err(_) => return,
                         };
-                        if !guard.should_apply(&data) {
-                            return;
-                        }
                         // Platform write is blocking I/O (Android JNI) — do it
                         // while holding the lock so no concurrent poll overwrites
                         // our dedup state between check and write.
                         if let Err(e) = guard.write_to_platform(&data) {
                             println!("[ECO] platform write failed: {}", e);
+                            guard.mark_failed(&data);
                             return;
                         }
                         guard.mark_applied(&data);
@@ -372,6 +434,98 @@ impl EcoManager {
             }
         }
 
+        // ---- Enterprise calls + SMS (Igris native, trust-gated) ----
+        {
+            let call = self.call.clone();
+            let call_log = self.call_log.clone();
+            let sms = self.sms.clone();
+            self.event_bus.subscribe(Arc::new(move |event| {
+                match event {
+                    EcoEvent::CallReceived(data) => {
+                        if let Some(ref mgr) = call {
+                            if let Ok(mut guard) = mgr.lock() {
+                                guard.receive_remote(data.clone());
+                                crate::eco::call::set_calls(guard.get_calls());
+                            }
+                        }
+                    }
+                    EcoEvent::CallLogSyncReceived(payload) => {
+                        if let Some(ref mgr) = call_log {
+                            if let Ok(guard) = mgr.lock() {
+                                guard.receive_remote(payload.clone());
+                                crate::eco::call::set_call_log(guard.get_log());
+                            }
+                        }
+                    }
+                    EcoEvent::SmsReceived(data) => {
+                        if let Some(ref mgr) = sms {
+                            if let Ok(mut guard) = mgr.lock() {
+                                guard.receive_remote(data.clone());
+                                crate::eco::sms::set_sms(guard.get_messages());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }));
+        }
+
+        // ---- Local call fan-out (host line events -> trusted peers) ----
+        // Desktop-only: the phone reports its own calls through the FFI
+        // telephony pipe, so this subscription is inert there. Desktop line
+        // events carry the local device id and must reach every trusted peer.
+        #[cfg(not(target_os = "android"))]
+        {
+            let transport = self.transport.clone();
+            self.event_bus.subscribe(Arc::new(move |event| {
+                if let EcoEvent::CallReceived(data) = event {
+                    let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+                    if local_id.is_empty() || data.device_id != local_id {
+                        return;
+                    }
+                    let transport = transport.clone();
+                    // The poller thread has no tokio runtime — give the
+                    // fan-out its own small one (mirrors the toast path).
+                    std::thread::spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(_) => return,
+                        };
+                        rt.block_on(async move {
+                            let targets: Vec<SocketAddr> = {
+                                let net = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+                                net.iter()
+                                    .filter(|d| d.is_trusted)
+                                    .filter_map(|d| {
+                                        d.ip.parse::<std::net::IpAddr>()
+                                            .ok()
+                                            .map(|ip| SocketAddr::new(ip, d.port))
+                                    })
+                                    .collect()
+                            };
+                            let payload = crate::eco::protocol::CallSyncPayload {
+                                call_id: data.call_id.clone(),
+                                event: data.event.clone(),
+                                phone_number: data.phone_number.clone(),
+                                contact_name: data.contact_name.clone(),
+                                contact_thumbnail_hash: String::new(),
+                                source_device_id: data.device_id.clone(),
+                                source_device_name: data.device_name.clone(),
+                                timestamp: data.timestamp,
+                                is_cancel: data.is_cancel,
+                            };
+                            for addr in targets {
+                                let _ = transport.send_call(&addr, &payload).await;
+                            }
+                        });
+                    });
+                }
+            }));
+        }
+
         self.running = true;
 
         self.event_bus.emit(EcoEvent::Synced(
@@ -443,19 +597,262 @@ impl EcoManager {
         self.notification.as_ref()
     }
 
+    /// Reply to a notification. Two paths:
+    /// - phone (the mirrored notification is a phone-native render backed by
+    ///   its RemoteInput channel): platform reply inline;
+    /// - desktop (the notification lives on the phone): route the reply over
+    ///   the transport to the originating device, then mark the local
+    ///   history entry replied.
     pub async fn reply_to_notification(&self, notification_id: &str, reply_text: &str) -> EcoResult<()> {
-        if let Some(ref mgr) = self.notification {
-            let guard = mgr.lock().map_err(|_| EcoError::Notification("Lock failed".to_string()))?;
-            guard.reply_to_notification(notification_id, reply_text)
-        } else {
-            Err(EcoError::NotInitialized)
+        #[cfg(target_os = "android")]
+        {
+            if let Some(ref mgr) = self.notification {
+                let guard = mgr.lock().map_err(|_| EcoError::Notification("Lock failed".to_string()))?;
+                guard.reply_to_notification(notification_id, reply_text)
+            } else {
+                Err(EcoError::NotInitialized)
+            }
         }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            if reply_text.trim().is_empty() {
+                return Err(EcoError::Notification("Empty reply".to_string()));
+            }
+
+            // Locate the notification and its originating device.
+            let (notification_key, device_id) = {
+                let guard = self.notification
+                    .as_ref()
+                    .ok_or(EcoError::NotInitialized)?
+                    .lock()
+                    .map_err(|_| EcoError::Notification("Lock failed".to_string()))?;
+                let target = guard
+                    .get_notifications()
+                    .into_iter()
+                    .find(|n| n.id == notification_id || n.notification_key == notification_id);
+                match target {
+                    Some(n) => (n.notification_key, n.device_id),
+                    None => return Err(EcoError::Notification(format!(
+                        "No such notification: {}", notification_id
+                    ))),
+                }
+            };
+
+            let addr = self.resolve_peer_addr(&device_id).await.ok_or_else(|| {
+                EcoError::Notification(format!(
+                    "No route to device {} — is it online and linked?", device_id
+                ))
+            })?;
+
+            let payload = crate::eco::protocol::NotificationReplyPayload {
+                notification_id: notification_id.to_string(),
+                notification_key,
+                reply_text: reply_text.to_string(),
+                source_device_id: crate::eco::pairing::get_local_device_id().unwrap_or_default(),
+            };
+            self.transport.send_notification_reply(&addr, &payload).await?;
+
+            // Reflect the reply locally.
+            if let Some(ref mgr) = self.notification {
+                if let Ok(mut guard) = mgr.lock() {
+                    guard.mark_replied(notification_id);
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Ask the originating phone to fire one of the notification's action
+    /// buttons (v2 wire path).
+    pub async fn fire_notification_action(&self, notification_id: &str, action_index: u32) -> EcoResult<()> {
+        let (notification_key, device_id) = {
+            let guard = self.notification
+                .as_ref()
+                .ok_or(EcoError::NotInitialized)?
+                .lock()
+                .map_err(|_| EcoError::Notification("Lock failed".to_string()))?;
+            let target = guard
+                .get_notifications()
+                .into_iter()
+                .find(|n| n.id == notification_id || n.notification_key == notification_id);
+            match target {
+                Some(n) => (n.notification_key, n.device_id),
+                None => return Err(EcoError::Notification(format!(
+                    "No such notification: {}", notification_id
+                ))),
+            }
+        };
+
+        let addr = self.resolve_peer_addr(&device_id).await.ok_or_else(|| {
+            EcoError::Notification(format!(
+                "No route to device {} — is it online and linked?", device_id
+            ))
+        })?;
+
+        let payload = crate::eco::protocol::NotificationActionPayload {
+            notification_key,
+            action_index,
+            source_device_id: crate::eco::pairing::get_local_device_id().unwrap_or_default(),
+        };
+        self.transport.send_notification_action(&addr, &payload).await
+    }
+
+    /// Ask a linked phone to transmit an SMS via its SIM slot (compose
+    /// on desktop, transmit on phone — like Continuity handoff).
+    pub async fn send_sms_message(
+        &self,
+        device_id: &str,
+        address: &str,
+        body: &str,
+    ) -> EcoResult<()> {
+        let addr = self.resolve_peer_addr(device_id).await.ok_or_else(|| {
+            EcoError::Sms(format!("No route to device {}", device_id))
+        })?;
+        let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+        let payload = crate::eco::protocol::SmsSendPayload {
+            address: address.to_string(),
+            body: body.to_string(),
+            source_device_id: local_id,
+        };
+        self.transport.request_sms_send(&addr, &payload).await
+    }
+
+    /// Search a linked phone's phonebook by name/number fragment for the
+    /// dial pad. Trust-gated peer-side; empty when offline or denied.
+    pub async fn search_peer_contacts(
+        &self,
+        device_id: &str,
+        query: &str,
+    ) -> EcoResult<Vec<crate::platform::ecosystem::ContactEntry>> {
+        let addr = self.resolve_peer_addr(device_id).await.ok_or_else(|| {
+            EcoError::Call(format!("No route to device {}", device_id))
+        })?;
+        let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+        self.transport
+            .search_contacts(&addr, &local_id, query, 8)
+            .await
+    }
+
+    pub async fn send_call_action(
+        &self,
+        device_id: &str,
+        call_id: &str,
+        action: &str,
+        phone_number: &str,
+    ) -> EcoResult<()> {
+        // Calls living on this host's own line execute through the local
+        // telephony hook; everything else is remote control (audio stays on
+        // the phone that owns the call).
+        let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+        if !local_id.is_empty() && device_id == local_id {
+            return crate::platform::ecosystem::hooks::execute_local_call_action(
+                call_id,
+                action,
+                phone_number,
+            );
+        }
+        let addr = self.resolve_peer_addr(device_id).await.ok_or_else(|| {
+            EcoError::Call(format!(
+                "No route to device {} — is it online and linked?", device_id
+            ))
+        })?;
+        let payload = crate::eco::protocol::CallActionPayload {
+            call_id: call_id.to_string(),
+            action: action.to_string(),
+            source_device_id: local_id,
+            phone_number: phone_number.to_string(),
+            contact_name: String::new(),
+        };
+        self.transport
+            .send_call_action(&addr, &payload)
+            .await
+            .map_err(|e| EcoError::Call(e.to_string()))
+    }
+
+    /// Push a call-log snapshot to a linked peer so both sides share
+    /// history. Trust-gated peer-side.
+    pub async fn send_call_log(
+        &self,
+        device_id: &str,
+        log: &[crate::eco::protocol::CallLogEntry],
+    ) -> EcoResult<()> {
+        let addr = self.resolve_peer_addr(device_id).await.ok_or_else(|| {
+            EcoError::Call(format!("No route to device {}", device_id))
+        })?;
+        let local_id = crate::eco::pairing::get_local_device_id().unwrap_or_default();
+        let local_name = crate::eco::pairing::get_local_device_name().unwrap_or_default();
+        let payload = crate::eco::protocol::CallLogSyncPayload {
+            calls: log.to_vec(),
+            source_device_id: local_id,
+            source_device_name: local_name,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+        self.transport
+            .send_call_log_sync(&addr, &payload)
+            .await
+            .map_err(|e| EcoError::Call(e.to_string()))
+    }
+
+    /// Resolve a trusted peer's address: learned inbound routes first,
+    /// live discovery snapshot as fallback (covers restarts where no
+    /// inbound request has refreshed the route table yet).
+    async fn resolve_peer_addr(&self, device_id: &str) -> Option<SocketAddr> {
+        // The discovery leaf keeps the peer's last advertised address,
+        // refreshed on every /info heartbeat + registration.
+        if let Some(disc) = &self.discovery {
+            let devices = disc.get_known_devices();
+            let learned = devices
+                .read()
+                .await
+                .get(device_id)
+                .and_then(|d| d.device.addr);
+            if let Some(addr) = learned {
+                return Some(addr);
+            }
+        }
+        let net = crate::eco::discovery::ECO_NETWORK_DEVICES.read().await;
+        net.iter().find(|d| d.id == device_id).and_then(|d| {
+            d.ip.parse::<std::net::IpAddr>()
+                .ok()
+                .map(|ip| SocketAddr::new(ip, d.port))
+        })
     }
 
     pub fn get_notifications(&self) -> Vec<crate::eco::notification::NotificationData> {
         if let Some(ref mgr) = self.notification {
             if let Ok(guard) = mgr.lock() {
                 return guard.get_notifications();
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn call_manager(&self) -> Option<Arc<std::sync::Mutex<CallManager>>> {
+        self.call.clone()
+    }
+
+    pub fn call_log_manager(&self) -> Option<Arc<std::sync::Mutex<CallLogManager>>> {
+        self.call_log.clone()
+    }
+
+    pub fn sms_manager(&self) -> Option<Arc<std::sync::Mutex<SmsManager>>> {
+        self.sms.clone()
+    }
+
+    pub fn get_calls(&self) -> Vec<crate::eco::call::CallData> {
+        if let Some(ref mgr) = self.call {
+            if let Ok(guard) = mgr.lock() {
+                return guard.get_calls();
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn get_sms(&self) -> Vec<crate::eco::sms::SmsData> {
+        if let Some(ref mgr) = self.sms {
+            if let Ok(guard) = mgr.lock() {
+                return guard.get_messages();
             }
         }
         Vec::new()

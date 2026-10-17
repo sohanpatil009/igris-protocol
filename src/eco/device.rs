@@ -16,6 +16,12 @@ pub struct Capabilities {
     pub clipboard_sync: bool,
     pub notification_sync: bool,
     pub remote_commands: bool,
+    #[serde(default)]
+    pub call_sync: bool,
+    #[serde(default)]
+    pub sms_sync: bool,
+    #[serde(default)]
+    pub clipboard_media: bool,
 }
 
 impl Default for Capabilities {
@@ -24,6 +30,9 @@ impl Default for Capabilities {
             clipboard_sync: true,
             notification_sync: false,
             remote_commands: false,
+            call_sync: false,
+            sms_sync: false,
+            clipboard_media: false,
         }
     }
 }
@@ -46,7 +55,7 @@ pub struct EcoDevice {
     /// `Some([])` = peer reports it has no trusted peers (stale trust).
     #[serde(default)]
     pub trusted_peers: Option<Vec<String>>,
-    /// Peer's advertised FastSwap (LocalSend v2) TLS port, from `/info`
+    /// Peer's advertised FastSwap native TLS port, from `/info`
     /// `fastswap_port`. 0 = peer is an old binary that didn't report it;
     /// callers should fall back to FASTSWAP_TLS_PORT (53318).
     #[serde(default)]

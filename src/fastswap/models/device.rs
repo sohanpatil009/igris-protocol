@@ -31,7 +31,7 @@ impl Device {
             device_type: DeviceType::Desktop,
             ip,
             port,
-            protocol: "2.0".to_string(),
+            protocol: "1.0".to_string(),
             download: false,
         }
     }

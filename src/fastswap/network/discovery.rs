@@ -107,7 +107,7 @@ impl DiscoveryService {
     }
 
     async fn probe_device_https(ip: &str, port: u16) -> Option<Device> {
-        let url = format!("https://{}:{}/api/localsend/v2/info", ip, port);
+        let url = format!("https://{}:{}/api/fastswap/v1/info", ip, port);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(2))

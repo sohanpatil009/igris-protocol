@@ -25,6 +25,10 @@ pub enum MessageType {
     NotificationReply(NotificationReplyPayload),
     NotificationDismissed(NotificationDismissPayload),
     NotificationAction(NotificationActionPayload),
+    CallSync(CallSyncPayload),
+    CallAction(CallActionPayload),
+    CallLogSync(CallLogSyncPayload),
+    SmsSync(SmsSyncPayload),
     PairingRequest(PairingPayload),
     PairingResponse(PairingPayload),
     Heartbeat,
@@ -51,6 +55,16 @@ pub struct ClipboardSyncPayload {
     pub content_type: String,
     pub source_device: String,
     pub timestamp: i64,
+    /// Enterprise media extension (backward compatible):
+    /// `encoding` is "text" (default) or "base64" for image/file bytes.
+    #[serde(default)]
+    pub encoding: String,
+    #[serde(default)]
+    pub file_name: String,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub byte_size: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -95,7 +109,7 @@ pub struct NotificationSyncPayload {
     #[serde(default)]
     pub app_package: String,
     /// Base64 PNG (<=96px, downscaled on the phone). `None` when the peer
-    /// already has this icon (`icon_hash` unchanged — KDE-style hash skip).
+    /// already has this icon (`icon_hash` unchanged — hash-skip).
     #[serde(default)]
     pub icon: Option<String>,
     /// MD5 hex of the icon bytes; the receiver caches icons by this hash.
@@ -149,6 +163,105 @@ pub struct PairingPayload {
     pub public_key: Option<String>,
     pub accepted: bool,
     pub message: Option<String>,
+}
+
+/// Enterprise call event (Igris native, no external telephony ref).
+/// `event`: ringing | missed | talking | ended
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallSyncPayload {
+    pub call_id: String,
+    pub event: String,
+    #[serde(default)]
+    pub phone_number: String,
+    #[serde(default)]
+    pub contact_name: String,
+    #[serde(default)]
+    pub contact_thumbnail_hash: String,
+    pub source_device_id: String,
+    pub source_device_name: String,
+    pub timestamp: i64,
+    #[serde(default)]
+    pub is_cancel: bool,
+}
+
+/// Enterprise call control: mute | accept | decline | end | dial.
+/// `dial` carries its target in `phone_number` (desk-initiated outgoing call).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallActionPayload {
+    pub call_id: String,
+    pub action: String,
+    pub source_device_id: String,
+    #[serde(default)]
+    pub phone_number: String,
+    #[serde(default)]
+    pub contact_name: String,
+}
+
+/// Enterprise phonebook search: desktop queries a linked phone by name or
+/// number fragment; the phone answers from its ContentProvider.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContactsSearchRequest {
+    pub requester_id: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default = "default_contacts_limit")]
+    pub limit: u32,
+}
+
+fn default_contacts_limit() -> u32 {
+    10
+}
+
+/// Enterprise SMS send request: desktop composes, phone's SIM transmits.
+/// Trust-gated; the phone executes via its SMS seam, never the desktop.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SmsSendPayload {
+    pub address: String,
+    pub body: String,
+    pub source_device_id: String,
+}
+
+/// Enterprise call-log snapshot: a batch of call-history rows exchanged
+/// between linked peers so the desktop mirrors the phone's call log.
+/// `call_type`: incoming | outgoing | missed | voicemail | rejected | blocked | answered_externally | unknown
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallLogSyncPayload {
+    pub calls: Vec<CallLogEntry>,
+    pub source_device_id: String,
+    pub source_device_name: String,
+    pub timestamp: i64,
+}
+
+/// One call-history row carried on the wire.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CallLogEntry {
+    pub call_id: String,
+    pub event: String,
+    pub phone_number: String,
+    pub contact_name: String,
+    pub device_name: String,
+    pub device_id: String,
+    pub timestamp: i64,
+    pub duration_seconds: i64,
+    pub call_type: String,
+    pub is_cancel: bool,
+}
+
+/// Enterprise SMS (v1): single message envelope, batched by sender.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SmsSyncPayload {
+    pub sms_id: String,
+    pub thread_id: String,
+    pub address: String,
+    pub body: String,
+    pub date: i64,
+    #[serde(default)]
+    pub read: bool,
+    #[serde(default)]
+    pub sub_id: i64,
+    pub source_device_id: String,
+    pub source_device_name: String,
+    pub timestamp: i64,
 }
 
 impl EcoMessage {

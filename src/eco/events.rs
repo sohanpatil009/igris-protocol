@@ -1,7 +1,9 @@
+use crate::eco::call::CallData;
 use crate::eco::clipboard::ClipboardData;
 use crate::eco::device::EcoDevice;
 use crate::eco::notification::{NotificationData, NotificationReply};
 use crate::eco::protocol::{NotificationActionPayload, NotificationDismissPayload};
+use crate::eco::sms::SmsData;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -24,6 +26,13 @@ pub enum EcoEvent {
     NotificationActionRequested(NotificationActionPayload),
     /// A peer requests all active notifications (initial sync on connect).
     NotificationRequested,
+
+    CallReceived(CallData),
+    CallLogSyncReceived(crate::eco::protocol::CallLogSyncPayload),
+    CallActionRequested(crate::eco::protocol::CallActionPayload),
+    SmsReceived(SmsData),
+    /// A peer asks this device to transmit an SMS via its SIM slot.
+    SmsSendRequested { address: String, body: String },
 
     PairingRequest(Arc<EcoDevice>),
     PairingAccepted(Arc<EcoDevice>),

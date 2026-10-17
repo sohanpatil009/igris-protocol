@@ -7,9 +7,9 @@
 //! (clipboard, notifications) through the traits in [`platform`]; the UniFFI
 //! surface in `ffi` (added in Phase 1) wraps this for Kotlin.
 //!
-//! Wire protocols preserved verbatim from the desktop:
-//! - Eco REST: `/api/ecosystem/v1/*` (clipboard + notification sync, pairing)
-//! - FastSwap: `/api/localsend/v2/*` (LocalSend v2.0 file transfer variant)
+//! Wire protocols (Igris native, enterprise):
+//! - Eco REST: `/api/ecosystem/v1/*` (clipboard + notification sync, pairing, calls, SMS)
+//! - FastSwap: `/api/fastswap/v1/*` (native file transfer)
 
 pub mod eco;
 pub mod fastswap;

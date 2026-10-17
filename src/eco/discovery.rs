@@ -3,8 +3,9 @@ use crate::eco::constants::*;
 use crate::eco::device::EcoDevice;
 use crate::eco::events::{EcoEvent, EventBus};
 use crate::eco::protocol::{
-    ClipboardSyncPayload, NotificationActionPayload, NotificationDismissPayload,
-    NotificationReplyPayload, NotificationSyncPayload,
+    CallActionPayload, CallLogSyncPayload, CallSyncPayload, ClipboardSyncPayload,
+    NotificationActionPayload, NotificationDismissPayload, NotificationReplyPayload,
+    NotificationSyncPayload, SmsSyncPayload,
 };
 use axum::extract::ConnectInfo;
 use serde::{Deserialize, Serialize};
@@ -171,9 +172,9 @@ impl DeviceDiscovery {
                         let cfg_ref = cfg_ref.clone();
                         async move {
                             let fastswap_tls_port = crate::fastswap::get_fastswap_tls_port();
-                            let (cfg_clipboard_sync, cfg_notification_sync) = {
+                            let (cfg_clipboard_sync, cfg_notification_sync, cfg_call_sync, cfg_sms_sync, cfg_clipboard_media) = {
                                 let cfg_guard = cfg_ref.read().unwrap();
-                                (cfg_guard.clipboard_sync, cfg_guard.notification_sync)
+                                (cfg_guard.clipboard_sync, cfg_guard.notification_sync, cfg_guard.call_sync, cfg_guard.sms_sync, cfg_guard.clipboard_media)
                             };
 
                             let trusted_peers: Vec<String> = {
@@ -193,6 +194,9 @@ impl DeviceDiscovery {
                                 "ecosystem": true,
                                 "clipboard_sync": cfg_clipboard_sync,
                                 "notification_sync": cfg_notification_sync,
+                                "call_sync": cfg_call_sync,
+                                "sms_sync": cfg_sms_sync,
+                                "clipboard_media": cfg_clipboard_media,
                                 "device_id": did,
                                 "device_name": dnm,
                                 "device_type": "mobile",
@@ -211,6 +215,10 @@ impl DeviceDiscovery {
                         let bus = bus.clone();
                         async move {
                             let payload = body.0;
+                            // Enterprise guard: enforce text (1 MiB) and media (10 MiB) limits.
+                            if payload.content.len() as u64 > 10 * 1024 * 1024 {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "payload too large"}));
+                            }
                             let hash = payload.content_hash.clone();
                             let data = crate::eco::clipboard::ClipboardData {
                                 content: payload.content,
@@ -218,6 +226,10 @@ impl DeviceDiscovery {
                                 content_hash: hash.clone(),
                                 source_device: payload.source_device,
                                 timestamp: payload.timestamp,
+                                encoding: payload.encoding,
+                                file_name: payload.file_name,
+                                mime_type: payload.mime_type,
+                                byte_size: payload.byte_size,
                             };
                             let hash_prefix = if hash.len() >= 8 { &hash[..8] } else { &hash };
                             tracing::info!("[ECO] clipboard/sync received hash={}", hash_prefix);
@@ -448,6 +460,244 @@ impl DeviceDiscovery {
                         }
                     }
                 }),
+            )
+            .route(
+                "/api/ecosystem/v1/notification/list",
+                axum::routing::get(|| async {
+                    axum::Json(crate::eco::notification::get_notifications())
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/call/sync",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<CallSyncPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let p = body.0;
+                            if !crate::eco::pairing::is_trusted_sync(&p.source_device_id) {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "untrusted"}));
+                            }
+                            let data = crate::eco::call::CallData {
+                                call_id: p.call_id,
+                                event: p.event,
+                                phone_number: p.phone_number,
+                                contact_name: p.contact_name,
+                                device_name: p.source_device_name,
+                                device_id: p.source_device_id,
+                                timestamp: p.timestamp,
+                                is_cancel: p.is_cancel,
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::CallReceived(data));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/call/action",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<CallActionPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let p = body.0;
+                            // Audio routing is a handset decision deferred by
+                            // the eco core: the answer action may beat the
+                            // OFFHOOK transition, so the request parks in
+                            // `eco::audio` and routing fires on the next
+                            // local call event instead of executing here.
+                            if !crate::eco::audio::peer_audio_request(&p.action) {
+                                tokio::task::spawn_blocking(move || {
+                                    bus.emit(EcoEvent::CallActionRequested(p));
+                                });
+                            }
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/call/log/sync",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<CallLogSyncPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let p = body.0;
+                            if !crate::eco::pairing::is_trusted_sync(&p.source_device_id) {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "untrusted"}));
+                            }
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::CallLogSyncReceived(p));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/sms/sync",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<SmsSyncPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let p = body.0;
+                            if !crate::eco::pairing::is_trusted_sync(&p.source_device_id) {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "untrusted"}));
+                            }
+                            let data = crate::eco::sms::SmsData {
+                                sms_id: p.sms_id,
+                                thread_id: p.thread_id,
+                                address: p.address,
+                                body: p.body,
+                                date: p.date,
+                                read: p.read,
+                                device_name: p.source_device_name,
+                                device_id: p.source_device_id,
+                                timestamp: p.timestamp,
+                            };
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::SmsReceived(data));
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/call/list",
+                axum::routing::get(|| async {
+                    axum::Json(crate::eco::call::get_calls())
+                }),
+            )
+            // ---- LAN audio link (desktop host seam; inert when unmapped) ----
+            .route(
+                "/api/ecosystem/v1/audio/status",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "session": crate::platform::ecosystem::hooks::audio_link_up()
+                    }))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/audio/attach",
+                axum::routing::post({
+                    move |body: axum::extract::Json<serde_json::Value>| async move {
+                        let host = body
+                            .0
+                            .get("host")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        match host.parse::<std::net::IpAddr>() {
+                            Ok(ip) => {
+                                match crate::platform::ecosystem::hooks::audio_attach(ip) {
+                                    Ok(()) => axum::Json(serde_json::json!({"status": "ok"})),
+                                    Err(e) => axum::Json(
+                                        serde_json::json!({"status": "error", "message": e}),
+                                    ),
+                                }
+                            }
+                            Err(_) => axum::Json(
+                                serde_json::json!({"status": "error", "message": "host must be an IP address"}),
+                            ),
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/audio/detach",
+                axum::routing::post(|| async {
+                    crate::platform::ecosystem::hooks::audio_detach();
+                    axum::Json(serde_json::json!({"status": "ok"}))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/audio/test/tone",
+                axum::routing::post(|| async {
+                    let sent = crate::platform::ecosystem::hooks::audio_test_tone();
+                    axum::Json(serde_json::json!({"status": if sent { "ok" } else { "no-link" }}))
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/call/log/list",
+                axum::routing::get(|| async {
+                    axum::Json(crate::eco::call::get_call_log())
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/sms/list",
+                axum::routing::get(|| async {
+                    axum::Json(crate::eco::sms::get_sms())
+                }),
+            )
+            .route(
+                "/api/ecosystem/v1/contacts/search",
+                axum::routing::post(
+                    |body: axum::extract::Json<
+                        crate::eco::protocol::ContactsSearchRequest,
+                    >| async move {
+                        let req = body.0;
+                        if !crate::eco::pairing::is_trusted_sync(&req.requester_id) {
+                            return axum::response::Response::builder()
+                                .status(axum::http::StatusCode::FORBIDDEN)
+                                .body(axum::body::Body::from(
+                                    "{\"status\":\"error\",\"message\":\"untrusted\"}",
+                                ))
+                                .unwrap();
+                        }
+                        // Enterprise caps: at most 50 hits, fields trimmed so a
+                        // hostile phonebook cannot blow up the response.
+                        let limit = req.limit.clamp(1, 50);
+                        let hits = crate::platform::ecosystem::contacts_search(&req.query, limit)
+                            .into_iter()
+                            .take(limit as usize)
+                            .map(|mut h| {
+                                h.name.truncate(100);
+                                h.number.truncate(32);
+                                h
+                            })
+                            .collect::<Vec<_>>();
+                        axum::response::Response::builder()
+                            .status(axum::http::StatusCode::OK)
+                            .header("Content-Type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::to_vec(&hits).unwrap_or_default(),
+                            ))
+                            .unwrap()
+                    },
+                ),
+            )
+            .route(
+                "/api/ecosystem/v1/sms/send",
+                axum::routing::post({
+                    let bus = event_bus.clone();
+                    move |body: axum::extract::Json<crate::eco::protocol::SmsSendPayload>| {
+                        let bus = bus.clone();
+                        async move {
+                            let p = body.0;
+                            if !crate::eco::pairing::is_trusted_sync(&p.source_device_id) {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "untrusted"}));
+                            }
+                            if p.address.trim().is_empty() || p.body.trim().is_empty() {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "empty"}));
+                            }
+                            if p.body.len() > 1600 {
+                                return axum::Json(serde_json::json!({"status": "error", "message": "too long"}));
+                            }
+                            let address = p.address.clone();
+                            let text = p.body.clone();
+                            tokio::task::spawn_blocking(move || {
+                                bus.emit(EcoEvent::SmsSendRequested { address, body: text });
+                            });
+                            axum::Json(serde_json::json!({"status": "ok"}))
+                        }
+                    }
+                }),
             );
 
         let bind_addr = *addr;
@@ -543,15 +793,17 @@ impl DeviceDiscovery {
                             let mut trusted = crate::eco::pairing::is_trusted_sync(&id);
                             // Stale trust detection: if we think this peer is
                             // trusted but the peer's /info says it does NOT
-                            // trust us back, the peer likely restarted and lost
-                            // its trust state. Demote it locally so the UI
-                            // reflects the real state.
+                            // trust us back, the peer either restarted (and
+                            // its node has not re-announced trust yet) or
+                            // genuinely dropped the link. Demote RAM-only so
+                            // the UI reflects the real state, but never
+                            // persist the demote — a reboot race must not
+                            // erase a saved pairing.
                             if trusted {
                                 if let Some(ref local) = local_id {
                                     match &peer.trusted_peers {
                                         Some(ids) if !ids.contains(local) => {
                                             trusted = false;
-                                            crate::eco::pairing::persist_untrust(&id);
                                             event_bus.emit(EcoEvent::DeviceUntrusted(
                                                 std::sync::Arc::new(peer.clone()),
                                             ));
@@ -571,7 +823,6 @@ impl DeviceDiscovery {
                                     match &peer.trusted_peers {
                                         Some(ids) if !ids.contains(local) => {
                                             trusted = false;
-                                            crate::eco::pairing::persist_untrust(&id);
                                             event_bus.emit(EcoEvent::DeviceUntrusted(
                                                 std::sync::Arc::new(peer.clone()),
                                             ));
@@ -678,6 +929,9 @@ impl DeviceDiscovery {
                         .get("notification_sync")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    eco.capabilities.call_sync = body.get("call_sync").and_then(|v| v.as_bool()).unwrap_or(false);
+                    eco.capabilities.sms_sync = body.get("sms_sync").and_then(|v| v.as_bool()).unwrap_or(false);
+                    eco.capabilities.clipboard_media = body.get("clipboard_media").and_then(|v| v.as_bool()).unwrap_or(false);
                     // Peer's self-reported trusted device list — used to detect
                     // stale trust (e.g. desktop restarted and lost trust).
                     eco.trusted_peers =

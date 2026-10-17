@@ -110,7 +110,7 @@ pub struct NotificationManager {
     store: NotificationStore,
     local_device_id: String,
     local_device_name: String,
-    /// Per-peer, per-key last icon hash sent on the wire (KDE-style
+    /// Per-peer, per-key last icon hash sent on the wire (hash-dedup:
     /// hash-dedup: the PNG bytes are skipped when the hash is unchanged).
     sent_icon_hashes: std::collections::HashMap<String, String>,
 }
@@ -198,7 +198,7 @@ impl NotificationManager {
 
     /// Receive a notification from a remote device. Notifications with the
     /// same `(device_id, notification_key)` identity are updated in place
-    /// instead of duplicated (KDE-style `update(np)`); the event still fires
+    /// instead of duplicated (update-in-place); the event still fires
     /// so peers/UI can react to the change.
     pub fn receive_remote(&mut self, notif: NotificationData) {
         if let Some(existing) = self
@@ -316,7 +316,7 @@ impl NotificationManager {
         })
     }
 
-    /// KDE-style icon dedup: returns `true` (and remembers the hash) only
+    /// Icon dedup: returns `true` (and remembers the hash) only
     /// when the icon for `(peer, key)` hasn't been sent with this hash yet.
     /// The caller should omit the icon bytes on `false` but keep `icon_hash`.
     pub fn should_send_icon(&mut self, peer_id: &str, key: &str, icon_hash: &str) -> bool {
@@ -359,6 +359,21 @@ impl NotificationManager {
     /// Get all notifications (from UI).
     pub fn get_notifications(&self) -> Vec<NotificationData> {
         self.store.notifications.clone()
+    }
+
+    /// Mark a notification as replied (by id or notification key).
+    /// Desktop-side: called after a wire reply reaches the originating phone.
+    /// Phone-side: not used (its platform reply confirms inline).
+    pub fn mark_replied(&mut self, notification_id: &str) {
+        if let Some(n) = self
+            .store
+            .notifications
+            .iter_mut()
+            .find(|n| n.id == notification_id || n.notification_key == notification_id)
+        {
+            n.replied = true;
+        }
+        self.store.save(&self.storage_path);
     }
 
     /// Get unread count.

@@ -83,7 +83,7 @@ impl TransferClient {
         let prepare_request = PrepareUploadRequest {
             info: DeviceInfo {
                 alias: local_device.alias.clone(),
-                version: "2.0".to_string(),
+                version: "1.0".to_string(),
                 device_model: local_device.device_model.clone(),
                 device_type: format!("{:?}", local_device.device_type).to_lowercase(),
                 fingerprint: local_device.id.clone(),
@@ -91,7 +91,7 @@ impl TransferClient {
             files: file_infos.clone(),
         };
 
-        let url = device_url(target, "/api/localsend/v2/prepare-upload");
+        let url = device_url(target, "/api/fastswap/v1/prepare-upload");
 
         tracing::info!("Preparing upload to {}", url);
         let response = self.client.post(&url).json(&prepare_request).send().await?;
@@ -112,7 +112,7 @@ impl TransferClient {
         let server_session_id = prepare_response.session_id.clone();
         tracing::info!("Upload prepared, server session: {}", server_session_id);
 
-        let confirm_url = device_url(target, "/api/localsend/v2/confirm-upload");
+        let confirm_url = device_url(target, "/api/fastswap/v1/confirm-upload");
         let confirm_request = ConfirmUploadRequest {
             session_id: server_session_id.clone(),
         };
@@ -263,7 +263,7 @@ async fn upload_file(
     let url = device_url(
         target,
         &format!(
-            "/api/localsend/v2/upload?sessionId={}&fileId={}&token={}",
+            "/api/fastswap/v1/upload?sessionId={}&fileId={}&token={}",
             server_session_id, file_id, token
         ),
     );

@@ -94,7 +94,14 @@ pub struct ServerState {
 }
 
 pub fn create_router(state: ServerState) -> Router {
+    // Canonical Igris native paths. Legacy `/api/localsend/v2/*` aliases are
+    // kept until all phones run the rebuilt native core, then removed.
     Router::new()
+        .route("/api/fastswap/v1/info", get(info_handler))
+        .route("/api/fastswap/v1/register", post(register_handler))
+        .route("/api/fastswap/v1/prepare-upload", post(prepare_upload_handler))
+        .route("/api/fastswap/v1/confirm-upload", post(confirm_upload_handler))
+        .route("/api/fastswap/v1/upload", post(upload_handler))
         .route("/api/localsend/v2/info", get(info_handler))
         .route("/api/localsend/v2/register", post(register_handler))
         .route("/api/localsend/v2/prepare-upload", post(prepare_upload_handler))
@@ -123,7 +130,7 @@ async fn register_handler(
 
     Json(RegisterResponse {
         alias: device.alias.clone(),
-        version: "2.0".to_string(),
+        version: "1.0".to_string(),
         device_model: device.device_model.clone(),
         device_type: device.device_type.clone(),
         fingerprint: device.id.clone(),

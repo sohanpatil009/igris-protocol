@@ -1,8 +1,9 @@
 use crate::eco::constants::*;
 use crate::eco::errors::{EcoError, EcoResult};
 use crate::eco::protocol::{
-    ClipboardSyncPayload, NotificationActionPayload, NotificationDismissPayload,
-    NotificationSyncPayload, NotificationReplyPayload,
+    CallActionPayload, CallLogSyncPayload, CallSyncPayload, ClipboardSyncPayload,
+    NotificationActionPayload, NotificationDismissPayload, NotificationSyncPayload,
+    NotificationReplyPayload, SmsSyncPayload,
 };
 use std::net::SocketAddr;
 
@@ -205,5 +206,102 @@ impl EcoTransport {
         }
 
         Ok(())
+    }
+
+    async fn post_json<T: serde::Serialize>(
+        &self,
+        addr: &SocketAddr,
+        path: &str,
+        payload: &T,
+    ) -> EcoResult<()> {
+        let url = format!("{}://{}{}", scheme_for_addr(addr), addr, path);
+        let resp = self.http_client
+            .post(&url)
+            .json(payload)
+            .send()
+            .await
+            .map_err(|e| EcoError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(EcoError::Transport(format!("Peer returned status {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    pub async fn send_call(&self, addr: &SocketAddr, payload: &CallSyncPayload) -> EcoResult<()> {
+        self.post_json(addr, "/api/ecosystem/v1/call/sync", payload).await
+    }
+
+    pub async fn send_call_action(&self, addr: &SocketAddr, payload: &CallActionPayload) -> EcoResult<()> {
+        self.post_json(addr, "/api/ecosystem/v1/call/action", payload).await
+    }
+
+    pub async fn send_call_log_sync(&self, addr: &SocketAddr, payload: &CallLogSyncPayload) -> EcoResult<()> {
+        self.post_json(addr, "/api/ecosystem/v1/call/log/sync", payload).await
+    }
+
+    pub async fn send_sms(&self, addr: &SocketAddr, payload: &SmsSyncPayload) -> EcoResult<()> {
+        self.post_json(addr, "/api/ecosystem/v1/sms/sync", payload).await
+    }
+
+    /// Ask a peer to transmit an SMS via its SIM slot (desktop composes).
+    pub async fn request_sms_send(
+        &self,
+        addr: &SocketAddr,
+        payload: &crate::eco::protocol::SmsSendPayload,
+    ) -> EcoResult<()> {
+        self.post_json(addr, "/api/ecosystem/v1/sms/send", payload)
+            .await
+    }
+
+    /// Search a linked phone's phonebook by name/number fragment.
+    pub async fn search_contacts(
+        &self,
+        addr: &SocketAddr,
+        requester_id: &str,
+        query: &str,
+        limit: u32,
+    ) -> EcoResult<Vec<crate::platform::ecosystem::ContactEntry>> {
+        #[derive(serde::Serialize)]
+        struct Req<'a> {
+            requester_id: &'a str,
+            query: &'a str,
+            limit: u32,
+        }
+        let url = format!(
+            "{}://{}/api/ecosystem/v1/contacts/search",
+            scheme_for_addr(addr),
+            addr
+        );
+        let resp = self
+            .http_client
+            .post(&url)
+            .json(&Req { requester_id, query, limit })
+            .send()
+            .await
+            .map_err(|e| EcoError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(EcoError::Transport(format!(
+                "Peer returned status {}",
+                resp.status()
+            )));
+        }
+        resp.json::<Vec<crate::platform::ecosystem::ContactEntry>>()
+            .await
+            .map_err(|e| EcoError::Transport(e.to_string()))
+    }
+
+    pub async fn request_notifications(&self, addr: &SocketAddr) -> EcoResult<Vec<crate::eco::notification::NotificationData>> {
+        let url = format!("{}://{}/api/ecosystem/v1/notification/list", scheme_for_addr(addr), addr);
+        let resp = self.http_client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| EcoError::Transport(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(EcoError::Transport(format!("Peer returned status {}", resp.status())));
+        }
+        resp.json::<Vec<crate::eco::notification::NotificationData>>()
+            .await
+            .map_err(|e| EcoError::Transport(e.to_string()))
     }
 }

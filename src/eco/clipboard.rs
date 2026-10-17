@@ -13,6 +13,14 @@ pub struct ClipboardData {
     pub content_hash: String,
     pub source_device: String,
     pub timestamp: i64,
+    #[allow(dead_code)]
+    pub encoding: String,
+    #[allow(dead_code)]
+    pub file_name: String,
+    #[allow(dead_code)]
+    pub mime_type: String,
+    #[allow(dead_code)]
+    pub byte_size: u64,
 }
 
 pub struct ClipboardManager {
@@ -25,6 +33,11 @@ pub struct ClipboardManager {
     /// one linked peer. Used to retry a push that failed while peers were
     /// offline instead of deduping it away forever.
     last_delivered_hash: Option<String>,
+    /// Hashes of remote payloads currently being written to the platform.
+    /// Closes the race where the 1s poll reads incoming text before the
+    /// apply subscriber finishes and re-broadcasts it as a local change
+    /// (harmless via hash dedup, but noisy and wasteful on metered links).
+    inflight_remote: std::collections::HashSet<String>,
 }
 
 impl ClipboardManager {
@@ -40,6 +53,7 @@ impl ClipboardManager {
             last_content_hash: None,
             last_applied_hash: None,
             last_delivered_hash: None,
+            inflight_remote: std::collections::HashSet::new(),
         }
     }
 
@@ -61,6 +75,11 @@ impl ClipboardManager {
                 if text.is_empty() { continue; }
                 let hash = hash_content(&text);
 
+                // Skip content that arrived from a peer and is still being
+                // applied (see `mark_inflight_remote`), plus our own dedup.
+                if guard.inflight_remote.contains(&hash) {
+                    continue;
+                }
                 let is_own_change = Some(&hash) == guard.last_applied_hash.as_ref();
                 let is_known = Some(&hash) == guard.last_content_hash.as_ref();
                 if is_own_change || is_known {
@@ -97,6 +116,10 @@ impl ClipboardManager {
                     content_hash: hash.clone(),
                     source_device: String::new(),
                     timestamp: chrono::Utc::now().timestamp_millis(),
+                    encoding: "text".to_string(),
+                    file_name: String::new(),
+                    mime_type: "text/plain".to_string(),
+                    byte_size: 0,
                 };
 
                 let event = EcoEvent::ClipboardChanged(Arc::new(data));
@@ -109,18 +132,43 @@ impl ClipboardManager {
         }
     }
 
+    /// Check whether incoming clipboard data should be applied (dedup gate)
+    /// and, if so, mark it in-flight so the poll loop does not re-broadcast
+    /// it while the platform write is in progress. Returns `true` when the
+    /// caller must proceed to `write_to_platform` + `mark_applied`.
+    /// Must be called holding the manager lock; the write itself must run
+    /// outside the lock (see callers).
+    pub fn claim_remote(&mut self, data: &ClipboardData) -> bool {
+        if self.last_content_hash.as_ref() == Some(&data.content_hash) {
+            return false;
+        }
+        if self.inflight_remote.contains(&data.content_hash) {
+            return false;
+        }
+        self.inflight_remote.insert(data.content_hash.clone());
+        true
+    }
+
     /// Check whether incoming clipboard data should be applied (dedup gate).
     /// Returns `true` if the content is new and should be written to the
     /// local clipboard. Caller must call `mark_applied()` after a successful
     /// write.
     pub fn should_apply(&self, data: &ClipboardData) -> bool {
         self.last_content_hash.as_ref() != Some(&data.content_hash)
+            && !self.inflight_remote.contains(&data.content_hash)
     }
 
     /// Write incoming clipboard to the local platform clipboard. This is a
     /// blocking I/O call (FFI into Android/iOS) and must NEVER be called
     /// while holding the Mutex.
+    /// Enterprise: text goes to `set_text`; base64 media goes to
+    /// `set_media` when the platform supports it, otherwise text fallback.
     pub fn write_to_platform(&self, data: &ClipboardData) -> EcoResult<()> {
+        if data.encoding == "base64" && !data.content.is_empty() {
+            if self.platform.set_media(&data.content, &data.mime_type, &data.file_name).is_ok() {
+                return Ok(());
+            }
+        }
         self.platform.set_text(&data.content)
     }
 
@@ -132,9 +180,16 @@ impl ClipboardManager {
         // Arrived via the mesh, so the mesh already has it — treat as delivered
         // so an identical local re-read isn't re-broadcast as "undelivered".
         self.last_delivered_hash = Some(data.content_hash.clone());
+        self.inflight_remote.remove(&data.content_hash);
 
         let arc = Arc::new(data.clone());
         self.event_bus.emit(EcoEvent::ClipboardApplied(arc));
+    }
+
+    /// Release an in-flight claim after a failed platform write so the next
+    /// poll rediscovers the content instead of dropping it silently.
+    pub fn mark_failed(&mut self, data: &ClipboardData) {
+        self.inflight_remote.remove(&data.content_hash);
     }
 
     pub fn get_current_hash(&self) -> Option<String> {
@@ -178,6 +233,10 @@ impl ClipboardManager {
             content_hash: hash,
             source_device: String::new(),
             timestamp: chrono::Utc::now().timestamp_millis(),
+            encoding: "text".to_string(),
+            file_name: String::new(),
+            mime_type: "text/plain".to_string(),
+            byte_size: 0,
         };
 
         let arc = Arc::new(data);
@@ -206,4 +265,60 @@ pub fn hash_content(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_manager() -> ClipboardManager {
+        struct Stub;
+        impl PlatformClipboard for Stub {
+            fn get_text(&self) -> EcoResult<String> {
+                Ok(String::new())
+            }
+            fn set_text(&self, _text: &str) -> EcoResult<()> {
+                Ok(())
+            }
+        }
+        let storage = Arc::new(std::sync::Mutex::new(EcoStorage::new(
+            &std::path::PathBuf::from("./pkg-test-clipboard"),
+        )));
+        ClipboardManager::new(Box::new(Stub), Arc::new(EventBus::new()), storage)
+    }
+
+    fn test_data(hash: &str) -> ClipboardData {
+        ClipboardData {
+            content: "x".to_string(),
+            content_type: "text/plain".to_string(),
+            content_hash: hash.to_string(),
+            source_device: "peer".to_string(),
+            timestamp: 1,
+            encoding: "text".to_string(),
+            file_name: String::new(),
+            mime_type: "text/plain".to_string(),
+            byte_size: 0,
+        }
+    }
+
+    #[test]
+    fn test_claim_blocks_poll_echo_then_applies() {
+        let mut m = test_manager();
+        let d = test_data("abc");
+        assert!(m.claim_remote(&d));
+        // Second claim (or poll should_apply) sees in-flight: no echo.
+        assert!(!m.should_apply(&d));
+        assert!(!m.claim_remote(&d));
+        m.mark_applied(&d);
+        assert!(!m.should_apply(&d));
+    }
+
+    #[test]
+    fn test_failed_write_releases_claim() {
+        let mut m = test_manager();
+        let d = test_data("def");
+        assert!(m.claim_remote(&d));
+        m.mark_failed(&d);
+        assert!(m.should_apply(&d));
+    }
 }
