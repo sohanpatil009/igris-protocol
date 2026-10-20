@@ -1,8 +1,8 @@
 use crate::eco::constants::*;
-use crate::eco::errors::{EcoError, EcoResult};
+use crate::eco::errors::EcoResult;
 use crate::eco::events::{EcoEvent, EventBus};
-use crate::eco::protocol::{NotificationDismissPayload, NotificationMessage};
-use crate::platform::ecosystem::notifications::{PlatformNotification, RawNotification};
+use crate::eco::protocol::NotificationMessage;
+use crate::platform::ecosystem::notifications::PlatformNotification;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

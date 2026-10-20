@@ -59,7 +59,7 @@ impl EcoStorage {
     }
 
     fn load_or_default(
-        config_path: &PathBuf,
+        _config_path: &PathBuf,
         trusted_path: &PathBuf,
         clipboard_path: &PathBuf,
     ) -> EcoStore {

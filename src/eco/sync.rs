@@ -1,4 +1,4 @@
-use crate::eco::clipboard::{ClipboardData, ClipboardManager};
+use crate::eco::clipboard::ClipboardManager;
 use crate::eco::device::EcoDevice;
 use crate::eco::discovery::{DiscoveredDevice, ECO_NETWORK_DEVICES};
 use crate::eco::errors::EcoResult;

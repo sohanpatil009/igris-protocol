@@ -2,7 +2,6 @@ use crate::fastswap::models::*;
 use anyhow::{Context, Result};
 use futures::future::join_all;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::watch;

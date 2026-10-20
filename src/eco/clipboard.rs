@@ -1,5 +1,5 @@
 use crate::eco::constants::*;
-use crate::eco::errors::{EcoError, EcoResult};
+use crate::eco::errors::EcoResult;
 use crate::eco::events::{EcoEvent, EventBus};
 use crate::eco::storage::{ClipboardEntry, EcoStorage};
 use crate::platform::ecosystem::PlatformClipboard;

@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, IsCa, BasicConstraints, KeyUsagePurpose, KeyPair};
-use rustls::SignatureScheme;
+use once_cell::sync::Lazy;
+use rcgen::{CertificateParams, IsCa, KeyUsagePurpose, KeyPair};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 const CERT_FILE: &str = "fastswap_cert.der";
 const KEY_FILE: &str = "fastswap_key.der";
@@ -31,7 +31,7 @@ pub fn get_or_create_tls_config() -> Result<TlsConfig> {
     } else {
         let mut params = CertificateParams::new(vec!["igris.local".to_string()])
             .context("Failed to create cert params")?;
-        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.is_ca = IsCa::NoCa;
         params.key_usages = vec![
             KeyUsagePurpose::KeyEncipherment,
             KeyUsagePurpose::DigitalSignature,
@@ -67,29 +67,65 @@ pub fn get_or_create_tls_config() -> Result<TlsConfig> {
     })
 }
 
-pub fn get_dangerous_client_config() -> Result<rustls::ClientConfig> {
+/// Stores trusted peer certificate fingerprints (SHA-256 of DER bytes).
+static TRUSTED_FINGERPRINTS: Lazy<Mutex<Vec<Vec<u8>>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
+/// Register a trusted peer fingerprint (called during pairing).
+pub fn trust_peer_fingerprint(fingerprint: Vec<u8>) {
+    if let Ok(mut fps) = TRUSTED_FINGERPRINTS.lock() {
+        if !fps.contains(&fingerprint) {
+            fps.push(fingerprint);
+        }
+    }
+}
+
+/// Compute SHA-256 fingerprint of a DER-encoded certificate.
+fn cert_fingerprint(cert: &rustls::pki_types::CertificateDer<'_>) -> Vec<u8> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(cert.as_ref());
+    hasher.finalize().to_vec()
+}
+
+pub fn get_tofu_client_config() -> Result<rustls::ClientConfig> {
     let config = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(
-            Arc::new(AcceptAnyCertVerifier),
-        )
+        .with_custom_certificate_verifier(Arc::new(TofuCertVerifier))
         .with_no_client_auth();
     Ok(config)
 }
 
 #[derive(Debug)]
-struct AcceptAnyCertVerifier;
+struct TofuCertVerifier;
 
-impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertVerifier {
+impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
         _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+        let fp = cert_fingerprint(end_entity);
+        let trusted = TRUSTED_FINGERPRINTS.lock().ok();
+
+        if let Some(ref fps) = trusted {
+            if fps.is_empty() {
+                // First connection — trust on first use
+                drop(trusted);
+                trust_peer_fingerprint(fp);
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+            if fps.contains(&fp) {
+                return Ok(rustls::client::danger::ServerCertVerified::assertion());
+            }
+        }
+
+        // Unknown fingerprint — reject
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer,
+        ))
     }
 
     fn verify_tls12_signature(

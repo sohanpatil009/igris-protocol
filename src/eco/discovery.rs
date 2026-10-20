@@ -1,4 +1,3 @@
-use crate::eco::config::EcosystemConfig;
 use crate::eco::constants::*;
 use crate::eco::device::EcoDevice;
 use crate::eco::events::{EcoEvent, EventBus};
@@ -450,7 +449,7 @@ impl DeviceDiscovery {
                 "/api/ecosystem/v1/notification/request",
                 axum::routing::post({
                     let bus = event_bus.clone();
-                    move |body: axum::extract::Json<serde_json::Value>| {
+                    move |_body: axum::extract::Json<serde_json::Value>| {
                         let bus = bus.clone();
                         async move {
                             tokio::task::spawn_blocking(move || {

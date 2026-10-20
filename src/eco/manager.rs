@@ -7,7 +7,7 @@ use crate::eco::device::{Capabilities, EcoDevice};
 use crate::eco::discovery::DeviceDiscovery;
 use crate::eco::errors::{EcoError, EcoResult};
 use crate::eco::events::{EcoEvent, EventBus};
-use crate::eco::notification::{NotificationManager, NOTIFICATION_HISTORY};
+use crate::eco::notification::NotificationManager;
 use crate::eco::permissions::EcoPermissions;
 use crate::eco::sms::SmsManager;
 use crate::eco::storage::EcoStorage;
@@ -240,7 +240,7 @@ impl EcoManager {
         // ---- Start ecosystem HTTP server (clipboard endpoint) ----
         let http_addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
         let transport = self.transport.clone();
-        let local_device = self.local_device.clone();
+        let _local_device = self.local_device.clone();
 
         let discovery = Arc::new(DeviceDiscovery::new(
             self.event_bus.clone(),
